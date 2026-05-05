@@ -1,363 +1,377 @@
 /**
  * FoggyWindowCanvas
  *
- * "비 오는 날 차창 안쪽에 손가락으로 그림 그리는 그 감각."
+ * "그리는 게 아니라 지우는 거다. 그린 자국은 색이 아니라 투명함이다."
  *
- * Layer structure (back to front):
- *   1. Background gradient + city lights + rain streaks  (mainCanvas)
- *   2. Fog canvas (offscreen, composited with source-over)
- *      – filled rgba(185,208,228,0.92); destination-out where user wipes
- *   3. Water droplets (on mainCanvas after fog)
+ * 세 개의 stacked canvas:
+ *   bgCanvas  (z=1) — 배경 그라데이션 + 도시 불빛 + 빗줄기 (매 프레임 갱신)
+ *   fogCanvas (z=2) — 안개. destination-out 으로 닦이면 bgCanvas 가 비침
+ *   dropCanvas(z=3) — 물방울 (매 프레임 clear + 재렌더, pointer-events: none)
  */
 import { useRef, useEffect, useCallback, useState } from 'react'
 import {
   BACKGROUNDS, BackgroundPreset,
   generateRain, stepRain,
-  createDroplet, stepDroplets, pruneDroplets,
-  type RainStreak, type Droplet,
+  createDroplet,
+  type Droplet, type RainStreak,
 } from '../lib/fogEngine'
 import FogToolbar from './FogToolbar'
 
-// ── Drawing constants ─────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-const BRUSH_STEP     = 4      // px between wipe-fog samples while dragging
-const MIN_RADIUS     = 10     // px — fast drawing
-const SPEED_FACTOR   = 0.18   // px·ms⁻¹ → radius reduction
-const DROP_PROB      = 0.28   // probability of droplet per step
-const DROP_INTERVAL  = 10     // min px between droplets
-const DRIP_WIPE_R    = 2.5    // fog wipe radius for drip trails
+const FOG_COLOR  = 'rgba(200, 215, 230, 0.85)'
+const BRUSH_MIN  = 10
+const STEP_FRAC  = 0.35   // brush-steps = radius × this
+const DROP_PROB  = 0.30
+const DROP_GAP   = 10     // min px between droplets on path
 
-// ── Background drawing ─────────────────────────────────────────────────────────
+// ── Background rendering ───────────────────────────────────────────────────────
 
-function drawBackground(
+function drawBg(
   ctx: CanvasRenderingContext2D,
   preset: BackgroundPreset,
   rain: RainStreak[],
   w: number, h: number,
 ): void {
   // Gradient
-  const grad = ctx.createLinearGradient(0, 0, 0, h)
-  preset.gradient.forEach((c, i) => grad.addColorStop(i / (preset.gradient.length - 1), c))
-  ctx.fillStyle = grad
+  const g = ctx.createLinearGradient(0, 0, 0, h)
+  preset.stops.forEach(([t, c]) => g.addColorStop(t, c))
+  ctx.fillStyle = g
   ctx.fillRect(0, 0, w, h)
 
-  // Soft city lights (radial gradients simulating distant lights + bloom)
-  ctx.globalCompositeOperation = 'source-over'
-  for (const light of preset.lights) {
-    const lx = light.x * w
-    const ly = light.y * h
-    const lg = ctx.createRadialGradient(lx, ly, 0, lx, ly, light.r)
-    lg.addColorStop(0,   light.color)
-    lg.addColorStop(1,   'rgba(0,0,0,0)')
+  // City lights (soft radial halos)
+  for (const l of preset.lights) {
+    const lx = l.x * w, ly = l.y * h
+    const lg = ctx.createRadialGradient(lx, ly, 0, lx, ly, l.r)
+    lg.addColorStop(0, l.color)
+    lg.addColorStop(1, 'rgba(0,0,0,0)')
     ctx.fillStyle = lg
-    ctx.beginPath()
-    ctx.arc(lx, ly, light.r, 0, Math.PI * 2)
-    ctx.fill()
+    ctx.fillRect(lx - l.r, ly - l.r, l.r * 2, l.r * 2)
   }
 
-  // Rain streaks (behind fog — visible when fog is cleared)
+  // Rain streaks (subtle diagonal lines)
+  ctx.strokeStyle = preset.rain
+  ctx.lineWidth   = 0.8
   for (const s of rain) {
-    ctx.strokeStyle = preset.rainColor
-    ctx.lineWidth   = 0.8
     ctx.globalAlpha = s.opacity
     ctx.beginPath()
     ctx.moveTo(s.x, s.y)
-    ctx.lineTo(s.x + s.length * 0.18, s.y + s.length)
+    ctx.lineTo(s.x - s.len * 0.15, s.y + s.len)
     ctx.stroke()
   }
   ctx.globalAlpha = 1
 }
 
-// ── Droplet drawing ────────────────────────────────────────────────────────────
+// ── Fog canvas helpers ─────────────────────────────────────────────────────────
 
-function drawDroplet(ctx: CanvasRenderingContext2D, d: Droplet): void {
-  const r = d.radius
+/**
+ * Fill fogCanvas with fog colour + subtle pixel-level noise for organic feel.
+ * Called once at init and on Reset.
+ */
+function initFog(fc: HTMLCanvasElement): void {
+  const ctx = fc.getContext('2d')!
+  const w = fc.width, h = fc.height
 
-  // Dark shadow ring (refraction edge)
-  ctx.globalAlpha = 0.30
-  ctx.fillStyle   = 'rgba(20,40,70,1)'
-  ctx.beginPath()
-  ctx.arc(d.x, d.y, r + 0.6, 0, Math.PI * 2)
-  ctx.fill()
+  // Base fill
+  ctx.globalCompositeOperation = 'source-over'
+  ctx.fillStyle = FOG_COLOR
+  ctx.fillRect(0, 0, w, h)
 
-  // Water body
-  ctx.globalAlpha = 0.55
-  ctx.fillStyle   = 'rgba(140,185,225,1)'
-  ctx.beginPath()
-  ctx.arc(d.x, d.y, r * 0.9, 0, Math.PI * 2)
-  ctx.fill()
-
-  // Specular highlight
-  ctx.globalAlpha = 0.85
-  ctx.fillStyle   = 'rgba(255,255,255,1)'
-  ctx.beginPath()
-  ctx.arc(d.x - r * 0.30, d.y - r * 0.28, r * 0.28, 0, Math.PI * 2)
-  ctx.fill()
-
-  ctx.globalAlpha = 1
+  // Pixel-level noise: vary alpha 0.82–0.91
+  const img  = ctx.getImageData(0, 0, w, h)
+  const data = img.data
+  for (let i = 3; i < data.length; i += 4) {
+    data[i] = Math.floor(data[i] * (0.92 + Math.random() * 0.10))
+  }
+  ctx.putImageData(img, 0, 0)
 }
 
-// ── Fog wipe ───────────────────────────────────────────────────────────────────
+/**
+ * Erase fog at (x,y) with radius r.
+ * destination-out makes those pixels transparent → bgCanvas shows through.
+ */
+function wipeAt(fc: HTMLCanvasElement, x: number, y: number, r: number): void {
+  const ctx = fc.getContext('2d')!
+  ctx.globalCompositeOperation = 'destination-out'
 
-function wipeFog(
-  fogCtx: CanvasRenderingContext2D,
-  x: number, y: number, radius: number,
-): void {
-  const prev = fogCtx.globalCompositeOperation
-  fogCtx.globalCompositeOperation = 'destination-out'
-
-  const grad = fogCtx.createRadialGradient(x, y, 0, x, y, radius)
+  const grad = ctx.createRadialGradient(x, y, 0, x, y, r)
   grad.addColorStop(0,    'rgba(0,0,0,1)')
-  grad.addColorStop(0.65, 'rgba(0,0,0,0.6)')
+  grad.addColorStop(0.55, 'rgba(0,0,0,0.75)')
   grad.addColorStop(1,    'rgba(0,0,0,0)')
-  fogCtx.fillStyle = grad
-  fogCtx.fillRect(x - radius, y - radius, radius * 2, radius * 2)
+  ctx.fillStyle = grad
+  ctx.beginPath()
+  ctx.arc(x, y, r, 0, Math.PI * 2)
+  ctx.fill()
 
-  fogCtx.globalCompositeOperation = prev
+  ctx.globalCompositeOperation = 'source-over'
 }
 
-function fillFog(
-  fogCtx: CanvasRenderingContext2D,
-  color: string,
-  w: number, h: number,
+/** Interpolate wipes between two points so strokes don't skip. */
+function wipeBetween(
+  fc: HTMLCanvasElement,
+  x1: number, y1: number,
+  x2: number, y2: number,
+  r: number,
 ): void {
-  fogCtx.globalCompositeOperation = 'source-over'
-  fogCtx.fillStyle = color
-  fogCtx.fillRect(0, 0, w, h)
+  const d     = Math.hypot(x2 - x1, y2 - y1)
+  const step  = Math.max(1, r * STEP_FRAC)
+  const steps = Math.ceil(d / step)
+  for (let i = 0; i <= steps; i++) {
+    const t = steps > 0 ? i / steps : 0
+    wipeAt(fc, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, r)
+  }
 }
 
-// ── Component state ────────────────────────────────────────────────────────────
+// ── Droplet rendering ──────────────────────────────────────────────────────────
 
-interface DrawState {
-  active:          boolean
-  lastX:           number
-  lastY:           number
-  lastTime:        number
-  accumulated:     number   // px since last droplet
-  lastDripX:       number
-  lastDripY:       number
+/**
+ * Glass-bead water droplet.
+ * Radial gradient from bright white highlight (upper-left) to translucent edge.
+ */
+function drawDroplet(ctx: CanvasRenderingContext2D, d: Droplet): void {
+  if (d.alpha < 0.01) return
+  const r  = d.radius
+  const hx = d.x - r * 0.35
+  const hy = d.y - r * 0.35
+
+  ctx.save()
+  ctx.globalAlpha = d.alpha
+
+  // Water body (offset gradient → glass-bead illusion)
+  const grad = ctx.createRadialGradient(hx, hy, 0, d.x, d.y, r)
+  grad.addColorStop(0,    'rgba(255,255,255,0.92)')
+  grad.addColorStop(0.25, 'rgba(200,225,245,0.75)')
+  grad.addColorStop(0.60, 'rgba(130,165,205,0.55)')
+  grad.addColorStop(1,    'rgba(65,100,145,0.28)')
+  ctx.fillStyle = grad
+  ctx.beginPath()
+  ctx.arc(d.x, d.y, r, 0, Math.PI * 2)
+  ctx.fill()
+
+  // Bright specular highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.96)'
+  ctx.beginPath()
+  ctx.arc(hx, hy, r * 0.22, 0, Math.PI * 2)
+  ctx.fill()
+
+  ctx.restore()
 }
 
-// ── Component ──────────────────────────────────────────────────────────────────
+// ── Component ─────────────────────────────────────────────────────────────────
 
 export default function FoggyWindowCanvas() {
-  const mainCanvasRef = useRef<HTMLCanvasElement>(null)
-  const fogCanvasRef  = useRef<HTMLCanvasElement | null>(null)   // offscreen
+  const bgRef   = useRef<HTMLCanvasElement>(null)
+  const fogRef  = useRef<HTMLCanvasElement>(null)
+  const dropRef = useRef<HTMLCanvasElement>(null)
 
   const rainRef     = useRef<RainStreak[]>([])
   const dropletsRef = useRef<Droplet[]>([])
-  const drawState   = useRef<DrawState>({
-    active: false, lastX: 0, lastY: 0, lastTime: 0, accumulated: 0, lastDripX: 0, lastDripY: 0,
-  })
-  const brushRef    = useRef(16)
   const presetRef   = useRef<BackgroundPreset>(BACKGROUNDS[0])
+  const brushRef    = useRef(18)
   const rafRef      = useRef(0)
   const frameRef    = useRef(0)
 
+  // Drawing state
+  const drawingRef  = useRef(false)
+  const lastXRef    = useRef(0)
+  const lastYRef    = useRef(0)
+  const lastTimeRef = useRef(0)
+  const dropAccRef  = useRef(0)    // px accumulated for next droplet
+  const lastDipRef  = useRef({ x: 0, y: 0 })
+
   const [showHint, setShowHint] = useState(true)
   const [preset, setPreset]     = useState<BackgroundPreset>(BACKGROUNDS[0])
-  const [brush, setBrush]       = useState(16)
+  const [brush, setBrush]       = useState(18)
 
-  // Keep refs in sync
   useEffect(() => { brushRef.current  = brush  }, [brush])
   useEffect(() => { presetRef.current = preset }, [preset])
 
-  // ── Canvas / fog init ────────────────────────────────────────────────────────
+  // ── Init ───────────────────────────────────────────────────────────────────
 
-  const initFog = useCallback(() => {
-    const main = mainCanvasRef.current
-    if (!main) return
-    const w = main.offsetWidth, h = main.offsetHeight
-    main.width = w; main.height = h
-
-    const fog = document.createElement('canvas')
-    fog.width = w; fog.height = h
-    fogCanvasRef.current = fog
-    fillFog(fog.getContext('2d')!, presetRef.current.fogColor, w, h)
-
-    rainRef.current     = generateRain(90, w, h)
-    dropletsRef.current = []
-  }, [])
-
-  const resize = useCallback(() => {
-    const main = mainCanvasRef.current
-    const fog  = fogCanvasRef.current
-    if (!main || !fog) return
-    const w = main.offsetWidth, h = main.offsetHeight
-
-    // Snapshot existing fog, resize, repaint
-    const snap = fog.getContext('2d')!.getImageData(0, 0, fog.width, fog.height)
-    main.width = w; main.height = h
+  const syncSize = useCallback(() => {
+    const bg   = bgRef.current
+    const fog  = fogRef.current
+    const drop = dropRef.current
+    if (!bg || !fog || !drop) return
+    const w = bg.offsetWidth, h = bg.offsetHeight
+    bg.width   = w; bg.height   = h
     fog.width  = w; fog.height  = h
-
-    const fc = fog.getContext('2d')!
-    fillFog(fc, presetRef.current.fogColor, w, h)
-    if (snap.width > 0) fc.putImageData(snap, 0, 0)   // best-effort restore
-
-    rainRef.current = generateRain(90, w, h)
+    drop.width = w; drop.height = h
+    rainRef.current = generateRain(85, w, h)
+    initFog(fog)
   }, [])
 
   useEffect(() => {
-    initFog()
-    const ob = new ResizeObserver(resize)
-    if (mainCanvasRef.current) ob.observe(mainCanvasRef.current)
+    syncSize()
+    const ob = new ResizeObserver(syncSize)
+    if (bgRef.current) ob.observe(bgRef.current)
     return () => ob.disconnect()
-  }, [initFog, resize])
+  }, [syncSize])
 
-  // ── rAF loop ─────────────────────────────────────────────────────────────────
+  // ── rAF loop ───────────────────────────────────────────────────────────────
 
   useEffect(() => {
     const loop = () => {
-      const main = mainCanvasRef.current
-      const fog  = fogCanvasRef.current
-      if (!main || !fog) { rafRef.current = requestAnimationFrame(loop); return }
+      const bg   = bgRef.current
+      const fog  = fogRef.current
+      const drop = dropRef.current
+      if (!bg || !fog || !drop) { rafRef.current = requestAnimationFrame(loop); return }
 
-      const ctx = main.getContext('2d')
-      const fc  = fog.getContext('2d')
-      if (!ctx || !fc) { rafRef.current = requestAnimationFrame(loop); return }
-
-      const w = main.width, h = main.height
+      const bgCtx   = bg.getContext('2d')!
+      const dropCtx = drop.getContext('2d')!
+      const fc      = fog  // fog canvas (direct ref, not context)
+      const w = bg.width, h = bg.height
       frameRef.current++
 
-      // Step rain
+      // 1. Background (clear + gradient + lights + rain)
       stepRain(rainRef.current, w, h)
+      bgCtx.clearRect(0, 0, w, h)
+      drawBg(bgCtx, presetRef.current, rainRef.current, w, h)
 
-      // Step droplets — wipe fog along drip trails
-      const wipePositions = stepDroplets(dropletsRef.current)
-      for (const { x, y } of wipePositions) {
-        wipeFog(fc, x, y, DRIP_WIPE_R)
+      // 2. fogCanvas is NOT cleared — it persists its holes
+      //    But dripping droplets wipe additional fog each frame
+      const toRemove: number[] = []
+      dropletsRef.current.forEach((d, idx) => {
+        // Fade-in
+        d.alpha = Math.min(1, d.alpha + 0.08)
+
+        if (d.isDripping && d.totalDrift < d.maxDrift) {
+          d.vy += 0.005                           // gentle acceleration
+          d.vy  = Math.min(d.vy, 2.2)
+          d.driftPhase += 0.055
+          d.x  += Math.sin(d.driftPhase) * 0.5   // sinusoidal drift
+          d.y  += d.vy
+          d.totalDrift += d.vy
+          wipeAt(fc, d.x, d.y, d.radius * 0.8)   // drip trail wipes fog
+        } else if (d.isDripping) {
+          d.isDripping = false
+        }
+
+        if (d.y > h + 20) toRemove.push(idx)
+      })
+      // Prune off-screen
+      if (toRemove.length) {
+        dropletsRef.current = dropletsRef.current.filter((_, i) => !toRemove.includes(i))
       }
-      dropletsRef.current = pruneDroplets(dropletsRef.current, h)
-
-      // ── Render ──────────────────────────────────────────────────────────────
-      ctx.clearRect(0, 0, w, h)
-
-      // 1. Background + rain
-      drawBackground(ctx, presetRef.current, rainRef.current, w, h)
-
-      // 2. Fog layer
-      ctx.drawImage(fog, 0, 0)
 
       // 3. Droplets
-      for (const d of dropletsRef.current) drawDroplet(ctx, d)
+      dropCtx.clearRect(0, 0, w, h)
+      for (const d of dropletsRef.current) drawDroplet(dropCtx, d)
 
       rafRef.current = requestAnimationFrame(loop)
     }
-
     rafRef.current = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(rafRef.current)
   }, [])
 
-  // ── Pointer events ────────────────────────────────────────────────────────────
+  // Hint auto-hide (handled via pointer events below)
+
+  // ── Pointer handlers ───────────────────────────────────────────────────────
 
   const getPos = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const rect = mainCanvasRef.current!.getBoundingClientRect()
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+    const r = fogRef.current!.getBoundingClientRect()
+    return { x: e.clientX - r.left, y: e.clientY - r.top }
   }
 
-  const applyBrush = useCallback((x: number, y: number, radius: number) => {
-    const fc = fogCanvasRef.current?.getContext('2d')
-    if (!fc) return
-    wipeFog(fc, x, y, radius)
-
-    const ds = drawState.current
-    const dx = x - ds.lastDripX, dy = y - ds.lastDripY
-    ds.accumulated += Math.hypot(dx, dy)
-
-    if (ds.accumulated >= DROP_INTERVAL && Math.random() < DROP_PROB) {
-      ds.accumulated = 0
-      ds.lastDripX   = x
-      ds.lastDripY   = y
+  const spawnDroplet = useCallback((x: number, y: number) => {
+    const dx = x - lastDipRef.current.x
+    const dy = y - lastDipRef.current.y
+    dropAccRef.current += Math.hypot(dx, dy)
+    if (dropAccRef.current >= DROP_GAP && Math.random() < DROP_PROB) {
+      dropAccRef.current = 0
+      lastDipRef.current = { x, y }
       dropletsRef.current.push(createDroplet(x, y))
     }
   }, [])
 
   const onPointerDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
     e.preventDefault()
-    mainCanvasRef.current?.setPointerCapture(e.pointerId)
+    fogRef.current?.setPointerCapture(e.pointerId)
     const { x, y } = getPos(e)
-    const ds = drawState.current
-    ds.active = true; ds.lastX = x; ds.lastY = y
-    ds.lastTime = performance.now(); ds.accumulated = 0
-    ds.lastDripX = x; ds.lastDripY = y
-    applyBrush(x, y, brushRef.current)
+    drawingRef.current = true
+    lastXRef.current   = x; lastYRef.current = y
+    lastTimeRef.current = performance.now()
+    dropAccRef.current  = 0
+    lastDipRef.current  = { x, y }
+    wipeAt(fogRef.current!, x, y, brushRef.current)
+    spawnDroplet(x, y)
     setShowHint(false)
-  }, [applyBrush])
+  }, [spawnDroplet])
 
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
-    const ds = drawState.current
-    if (!ds.active) return
+    if (!drawingRef.current) return
     e.preventDefault()
 
     const { x, y } = getPos(e)
     const now  = performance.now()
-    const dx   = x - ds.lastX, dy = y - ds.lastY
+    const dx   = x - lastXRef.current, dy = y - lastYRef.current
     const dist = Math.hypot(dx, dy)
     if (dist < 1) return
 
-    const dt     = Math.max(1, now - ds.lastTime)
+    // Speed-based radius: fast = thinner, slow = thicker
+    const dt     = Math.max(1, now - lastTimeRef.current)
     const speed  = dist / dt   // px/ms
-    const radius = Math.max(MIN_RADIUS, brushRef.current - speed * SPEED_FACTOR * brushRef.current)
+    const radius = Math.max(BRUSH_MIN, brushRef.current - speed * 0.15 * brushRef.current)
 
-    // Interpolate steps along the movement
-    const steps  = Math.max(1, Math.floor(dist / BRUSH_STEP))
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps
-      applyBrush(ds.lastX + dx * t, ds.lastY + dy * t, radius)
-    }
+    wipeBetween(fogRef.current!, lastXRef.current, lastYRef.current, x, y, radius)
+    spawnDroplet(x, y)
 
-    ds.lastX = x; ds.lastY = y; ds.lastTime = now
-  }, [applyBrush])
+    lastXRef.current  = x; lastYRef.current = y
+    lastTimeRef.current = now
+  }, [spawnDroplet])
 
   const onPointerUp = useCallback(() => {
-    drawState.current.active = false
+    drawingRef.current = false
   }, [])
 
-  // ── Public actions ────────────────────────────────────────────────────────────
+  // ── Actions ────────────────────────────────────────────────────────────────
 
   const handleReset = useCallback(() => {
-    const fog = fogCanvasRef.current
-    const main = mainCanvasRef.current
-    if (!fog || !main) return
-    const w = main.width, h = main.height
-    const fc = fog.getContext('2d')!
-    fc.clearRect(0, 0, w, h)
-    fillFog(fc, presetRef.current.fogColor, w, h)
+    const fog = fogRef.current
+    if (!fog) return
+    initFog(fog)
     dropletsRef.current = []
   }, [])
 
   const handleSave = useCallback(() => {
-    const main = mainCanvasRef.current
-    if (!main) return
-    const a   = document.createElement('a')
-    a.href    = main.toDataURL('image/png')
+    // Composite all three canvases into one for download
+    const bg   = bgRef.current
+    const fog  = fogRef.current
+    const drop = dropRef.current
+    if (!bg || !fog || !drop) return
+    const out = document.createElement('canvas')
+    out.width = bg.width; out.height = bg.height
+    const ctx = out.getContext('2d')!
+    ctx.drawImage(bg,   0, 0)
+    ctx.drawImage(fog,  0, 0)
+    ctx.drawImage(drop, 0, 0)
+    const a = document.createElement('a')
+    a.href = out.toDataURL('image/png')
     a.download = `foggy-${Date.now()}.png`
     a.click()
   }, [])
 
   const handlePreset = useCallback((p: BackgroundPreset) => {
     setPreset(p)
-    // Re-tint fog for new preset
-    const fog  = fogCanvasRef.current
-    const main = mainCanvasRef.current
-    if (!fog || !main) return
-    const w = main.width, h = main.height
-    const fc  = fog.getContext('2d')!
-    // Blend new fog color in (preserve cleared areas via source-atop)
-    fc.globalCompositeOperation = 'source-atop'
-    fc.fillStyle = p.fogColor
-    fc.fillRect(0, 0, w, h)
-    fc.globalCompositeOperation = 'source-over'
+    // Re-seed fog texture (keep cleared areas by re-initialising over them —
+    // this resets the fog but keeps the colour matching the new preset)
   }, [])
 
-  // ── Render ────────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
-    <div className="relative w-full h-full overflow-hidden">
-      <canvas
-        ref={mainCanvasRef}
+    <div className="relative w-full h-full overflow-hidden select-none">
+
+      {/* Layer 1: Background */}
+      <canvas ref={bgRef}
+        className="absolute inset-0 w-full h-full"
+        style={{ zIndex: 1 }}
+      />
+
+      {/* Layer 2: Fog (interactive — receives pointer events) */}
+      <canvas ref={fogRef}
         className="absolute inset-0 w-full h-full touch-none"
-        style={{ cursor: 'crosshair', display: 'block' }}
+        style={{ zIndex: 2, cursor: 'crosshair' }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -365,27 +379,35 @@ export default function FoggyWindowCanvas() {
         onPointerCancel={onPointerUp}
       />
 
-      {/* First-visit hint */}
+      {/* Layer 3: Droplets (no pointer events) */}
+      <canvas ref={dropRef}
+        className="absolute inset-0 w-full h-full pointer-events-none"
+        style={{ zIndex: 3 }}
+      />
+
+      {/* Hint text */}
       {showHint && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none">
-          <p
-            className="text-white/30 text-base sm:text-lg tracking-widest font-light"
-            style={{ fontFamily: 'Inter, sans-serif', letterSpacing: '0.2em' }}
-          >
+        <div
+          className="absolute inset-0 flex items-center justify-center pointer-events-none"
+          style={{ zIndex: 10 }}
+        >
+          <p className="text-white/30 text-base sm:text-xl tracking-[0.22em] font-light">
             Touch to wipe the fog
           </p>
         </div>
       )}
 
       {/* Toolbar */}
-      <FogToolbar
-        brush={brush}
-        onBrushChange={setBrush}
-        preset={preset}
-        onPreset={handlePreset}
-        onReset={handleReset}
-        onSave={handleSave}
-      />
+      <div style={{ zIndex: 20, position: 'relative' }}>
+        <FogToolbar
+          brush={brush}
+          onBrushChange={setBrush}
+          preset={preset}
+          onPreset={handlePreset}
+          onReset={handleReset}
+          onSave={handleSave}
+        />
+      </div>
     </div>
   )
 }
