@@ -1,8 +1,8 @@
 export interface Point {
   x: number
   y: number
-  t: number          // timestamp (ms, from performance.now())
-  pressure?: number  // 0–1, undefined if device doesn't report it
+  t: number
+  pressure?: number
 }
 
 export interface Stroke {
@@ -23,11 +23,16 @@ export interface Drawing {
 
 export interface StrokeAnalysis {
   length: number
-  angle: number      // degrees, direction the stroke points
-  speed: number      // pixels per ms
-  curvature: number  // 0 = straight, 1 = very curved
+  angle: number
+  speed: number
+  curvature: number
   launchPoint: Point
   burstPoint: Point
+}
+
+export interface TrailPoint {
+  x: number
+  y: number
 }
 
 export interface Particle {
@@ -38,14 +43,42 @@ export interface Particle {
   alpha: number
   color: string
   size: number
-  decay: number      // alpha reduction per frame
   gravity: number
+  life: number
+  maxLife: number
+  trail: TrailPoint[]
+  decay: number
+  secondaryAt?: number
+  // ── Outline mode: position managed by lerp-to-target, not velocity physics ──
+  mode?: 'outline'
+  originX?: number
+  originY?: number
+  targetX?: number
+  targetY?: number
 }
 
 export interface Firework {
   id: number
   particles: Particle[]
   alive: boolean
+}
+
+// ── World-level effects ───────────────────────────────────────────────────────
+
+export interface Flash {
+  x: number
+  y: number
+  radius: number
+  alpha: number
+  life: number
+  maxLife: number
+  color: string
+}
+
+export interface WorldState {
+  fireworks: Firework[]
+  flashes: Flash[]
+  globalGlowAlpha: number
 }
 
 export interface DrawingControls {
@@ -55,13 +88,17 @@ export interface DrawingControls {
 
 // ── Firework blueprint ────────────────────────────────────────────────────────
 
-export type FireworkPattern = 'sphere' | 'trail' | 'outline' | 'willow'
+export type FireworkPattern = 'sphere' | 'trail' | 'outline' | 'willow' | 'arc'
 
 export interface ParticleVector {
-  angle: number   // radians
-  speed: number   // pixels per frame
+  angle: number
+  speed: number
   color: string
-  life: number    // frames until fully faded (controls decay rate)
+  life: number
+  // For outline pattern: absolute canvas coordinates of the destination point.
+  // When set, the engine ignores angle/speed and uses lerp-to-target instead.
+  targetX?: number
+  targetY?: number
 }
 
 export interface FireworkBlueprint {
@@ -69,5 +106,22 @@ export interface FireworkBlueprint {
   burstPoint: { x: number; y: number }
   particleVectors: ParticleVector[]
   pattern: FireworkPattern
-  duration: number  // ms — how long the burst animation runs
+  duration: number
+}
+
+// ── Multi-stroke sequencing ───────────────────────────────────────────────────
+
+export interface ScheduledBlueprint {
+  blueprint: FireworkBlueprint
+  delayMs: number  // time from sequence start to fire this blueprint
+}
+
+/**
+ * Result of analysing a full Drawing.
+ * `shots` = one blueprint per stroke, staggered 0.3–0.6 s apart.
+ * `grandFinale` = 5–8 mini sphere bursts fired 0.5 s after the last stroke.
+ */
+export interface DrawingSequence {
+  shots: ScheduledBlueprint[]
+  grandFinale: ScheduledBlueprint[]
 }

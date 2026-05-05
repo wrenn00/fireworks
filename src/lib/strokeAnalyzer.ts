@@ -5,9 +5,12 @@ import type {
   FireworkBlueprint,
   FireworkPattern,
   ParticleVector,
+  DrawingSequence,
+  ScheduledBlueprint,
+  StrokeAnalysis,
 } from './types'
 
-// ── Low-level geometry helpers ────────────────────────────────────────────────
+// ── Low-level geometry ────────────────────────────────────────────────────────
 
 function dist2(a: { x: number; y: number }, b: { x: number; y: number }): number {
   return Math.hypot(b.x - a.x, b.y - a.y)
@@ -19,73 +22,91 @@ function arcLength(points: Point[]): number {
   return len
 }
 
-/** Normalise angle to [0, 2π) */
 function normalizeAngle(a: number): number {
   return ((a % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)
 }
 
+/**
+ * Resample `points` into exactly `n` evenly-spaced positions along the arc.
+ * Returns absolute (x, y) canvas coordinates.
+ */
+function resampleUniform(points: Point[], n: number): Array<{ x: number; y: number }> {
+  if (points.length === 0 || n === 0) return []
+  if (points.length === 1 || n === 1) return [{ x: points[0].x, y: points[0].y }]
 
-// ── Color helpers ─────────────────────────────────────────────────────────────
+  // Build cumulative arc-length table
+  const cum = [0]
+  for (let i = 1; i < points.length; i++) cum.push(cum[i - 1] + dist2(points[i - 1], points[i]))
+  const total = cum[cum.length - 1]
+  if (total === 0) return Array.from({ length: n }, () => ({ x: points[0].x, y: points[0].y }))
 
-/** Parse any CSS hex color (#rgb, #rrggbb) into [r, g, b] 0-255 */
+  const result: Array<{ x: number; y: number }> = []
+  for (let k = 0; k < n; k++) {
+    const target = (k / (n - 1)) * total
+    // Binary search for the segment containing `target`
+    let lo = 0, hi = cum.length - 1
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1
+      if (cum[mid] <= target) lo = mid; else hi = mid
+    }
+    const segLen = cum[hi] - cum[lo]
+    const t = segLen > 0 ? (target - cum[lo]) / segLen : 0
+    result.push({
+      x: points[lo].x + (points[hi].x - points[lo].x) * t,
+      y: points[lo].y + (points[hi].y - points[lo].y) * t,
+    })
+  }
+  return result
+}
+
+// ── Colour helpers ────────────────────────────────────────────────────────────
+
 function hexToRgb(hex: string): [number, number, number] {
   const h = hex.replace('#', '')
-  const full = h.length === 3
-    ? h.split('').map(c => c + c).join('')
-    : h
+  const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h
   const n = parseInt(full, 16)
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
 }
 
-/** Shift hue by `delta` degrees, keeping saturation/lightness roughly intact.
- *  Operates in a simplified RGB ↔ HSL space. */
 function shiftHue(hex: string, deltaDeg: number): string {
   const [r, g, b] = hexToRgb(hex).map(v => v / 255)
   const max = Math.max(r, g, b), min = Math.min(r, g, b)
   const l = (max + min) / 2
-  if (max === min) return hex // achromatic
-
+  if (max === min) return hex
   const d = max - min
   const s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
   let h: number
-  if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0)) / 6
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6
   else if (max === g) h = ((b - r) / d + 2) / 6
-  else                h = ((r - g) / d + 4) / 6
-
+  else h = ((r - g) / d + 4) / 6
   const h2 = ((h + deltaDeg / 360) % 1 + 1) % 1
-
   const q = l < 0.5 ? l * (1 + s) : l + s - l * s
   const p = 2 * l - q
   const hue2rgb = (t: number) => {
     const tt = ((t % 1) + 1) % 1
-    if (tt < 1/6) return p + (q - p) * 6 * tt
-    if (tt < 1/2) return q
-    if (tt < 2/3) return p + (q - p) * (2/3 - tt) * 6
+    if (tt < 1 / 6) return p + (q - p) * 6 * tt
+    if (tt < 1 / 2) return q
+    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6
     return p
   }
-  const nr = Math.round(hue2rgb(h2 + 1/3) * 255)
-  const ng = Math.round(hue2rgb(h2) * 255)
-  const nb = Math.round(hue2rgb(h2 - 1/3) * 255)
-  return `rgb(${nr},${ng},${nb})`
+  return `rgb(${Math.round(hue2rgb(h2 + 1/3) * 255)},${Math.round(hue2rgb(h2) * 255)},${Math.round(hue2rgb(h2 - 1/3) * 255)})`
 }
 
-/** Pick a hue-shifted variant for visual spread */
 function variantColor(base: string, index: number, total: number): string {
-  const spread = 40 // ±40° hue spread
-  const delta = ((index / total) - 0.5) * spread * 2
-  return shiftHue(base, delta)
+  return shiftHue(base, ((index / total) - 0.5) * 80)
 }
 
 // ── Per-stroke metrics ────────────────────────────────────────────────────────
 
 interface StrokeMetrics {
-  arc: number          // total arc length in px
-  chord: number        // straight-line distance first→last
-  curvature: number    // 0 = straight, 1 = very curved
-  isClosed: boolean    // start and end within 10% of bounding diagonal
-  avgSpeed: number     // px / ms
-  aspectRatio: number  // bounding-box width / height (or height/width, always ≥ 1)
-  directionVectors: Array<{ angle: number; weight: number }> // sub-segment directions
+  arc: number
+  chord: number
+  curvature: number
+  isClosed: boolean
+  avgSpeed: number
+  aspectRatio: number   // always ≥ 1
+  rawAspect: number     // w/h (can be < 1)
+  directionVectors: Array<{ angle: number; weight: number }>
   center: { x: number; y: number }
   bounds: { w: number; h: number }
 }
@@ -93,11 +114,12 @@ interface StrokeMetrics {
 function measureStroke(stroke: Stroke): StrokeMetrics {
   const { points } = stroke
   if (points.length < 2) {
+    const p0 = points[0] ?? { x: 0, y: 0 }
     return {
       arc: 0, chord: 0, curvature: 0, isClosed: true,
-      avgSpeed: 0, aspectRatio: 1,
+      avgSpeed: 0, aspectRatio: 1, rawAspect: 1,
       directionVectors: [],
-      center: points[0] ?? { x: 0, y: 0 },
+      center: p0,
       bounds: { w: 0, h: 0 },
     }
   }
@@ -116,16 +138,11 @@ function measureStroke(stroke: Stroke): StrokeMetrics {
   const w = maxX - minX
   const h = maxY - minY
   const diag = Math.hypot(w, h)
-  const isClosed = chord < diag * 0.15 && arc > diag * 0.5
+  const isClosed = chord < diag * 0.20 && arc > diag * 0.5
 
   const elapsedMs = Math.max(1, points[points.length - 1].t - points[0].t)
-  const avgSpeed = arc / elapsedMs
+  const rawAspect = w / Math.max(h, 1)
 
-  const a = Math.max(w, h)
-  const b = Math.max(Math.min(w, h), 1)
-  const aspectRatio = a / b
-
-  // Build direction vectors from sub-segments (sample ≤ 64 segments for perf)
   const step = Math.max(1, Math.floor(points.length / 64))
   const directionVectors: Array<{ angle: number; weight: number }> = []
   for (let i = 0; i < points.length - step; i += step) {
@@ -133,45 +150,49 @@ function measureStroke(stroke: Stroke): StrokeMetrics {
     const dy = points[i + step].y - points[i].y
     const segLen = Math.hypot(dx, dy)
     if (segLen > 0) {
-      directionVectors.push({
-        angle: normalizeAngle(Math.atan2(dy, dx)),
-        weight: segLen,
-      })
+      directionVectors.push({ angle: normalizeAngle(Math.atan2(dy, dx)), weight: segLen })
     }
   }
 
   return {
-    arc, chord, curvature, isClosed, avgSpeed,
-    aspectRatio,
+    arc, chord, curvature, isClosed,
+    avgSpeed: arc / elapsedMs,
+    aspectRatio: Math.max(w, h) / Math.max(Math.min(w, h), 1),
+    rawAspect,
     directionVectors,
     center: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 },
     bounds: { w, h },
   }
 }
 
-// ── Shape classifier ─────────────────────────────────────────────────────────
+// ── Shape classifier ──────────────────────────────────────────────────────────
 
 /**
- * Classify a single stroke into a firework pattern.
- *
  * Decision tree:
- *  closed shape          → outline  (particles trace the drawn outline)
- *  curvature < 0.12      → trail    (comet-like: narrow directional burst)
- *  aspect ratio > 2.5    → willow   (long elongated → drooping willow tail)
- *  else                  → sphere   (generic radial burst)
+ *  < 8 points         → sphere  (too few points to distinguish shape)
+ *  chord/arc < 0.20   → outline (closed shape)
+ *  aspect > 3 or < 0.33 → trail (long straight line)
+ *  else               → arc    (general curve)
  */
 export function classifyShape(stroke: Stroke): FireworkPattern {
+  if (stroke.points.length < 8) return 'sphere'
+
   const m = measureStroke(stroke)
 
-  if (m.isClosed)          return 'outline'
-  if (m.curvature < 0.12)  return 'trail'
-  if (m.aspectRatio > 2.5) return 'willow'
-  return 'sphere'
+  if (m.isClosed) return 'outline'
+
+  // Strongly elongated → trail (comet)
+  if (m.rawAspect > 3 || m.rawAspect < 0.33) return 'trail'
+
+  // Willow: tall stroke drawn quickly (upward sweep)
+  if (m.rawAspect < 0.55 && m.avgSpeed > 0.8) return 'willow'
+
+  // Gentle curve
+  return 'arc'
 }
 
-// ── Particle vector generators (one per pattern) ──────────────────────────────
+// ── Particle vector generators ────────────────────────────────────────────────
 
-/** Radial burst in all directions */
 function sphereVectors(
   count: number,
   baseSpeed: number,
@@ -186,7 +207,6 @@ function sphereVectors(
   }))
 }
 
-/** Narrow cone in the stroke's primary direction */
 function trailVectors(
   dirVectors: StrokeMetrics['directionVectors'],
   count: number,
@@ -194,7 +214,6 @@ function trailVectors(
   color: string,
   baseLife: number,
 ): ParticleVector[] {
-  // Weighted mean angle
   let sx = 0, sy = 0, totalW = 0
   for (const { angle, weight } of dirVectors) {
     sx += Math.cos(angle) * weight
@@ -202,7 +221,7 @@ function trailVectors(
     totalW += weight
   }
   const meanAngle = totalW > 0 ? Math.atan2(sy / totalW, sx / totalW) : 0
-  const coneHalf = Math.PI / 10 // ±18°
+  const coneHalf = Math.PI / 10
 
   return Array.from({ length: count }, (_, i) => ({
     angle: meanAngle + (Math.random() - 0.5) * coneHalf * 2,
@@ -213,39 +232,59 @@ function trailVectors(
 }
 
 /**
- * Particles placed along the drawn outline, fired outward from the center.
- * Preserves the recognisable shape of the original stroke.
+ * Arc: spread particles along the stroke's tangent directions.
+ * Each particle's angle is sampled from one of the stroke's direction vectors,
+ * spread ±45° around it — gives a curved, directional burst.
  */
-function outlineVectors(
-  stroke: Stroke,
-  center: { x: number; y: number },
+function arcVectors(
+  dirVectors: StrokeMetrics['directionVectors'],
   count: number,
   baseSpeed: number,
   color: string,
   baseLife: number,
 ): ParticleVector[] {
-  const { points } = stroke
-  const step = Math.max(1, Math.floor(points.length / count))
-  const result: ParticleVector[] = []
+  if (dirVectors.length === 0) return sphereVectors(count, baseSpeed, color, baseLife)
 
-  for (let i = 0; i < points.length && result.length < count; i += step) {
-    const p = points[i]
-    const angle = Math.atan2(p.y - center.y, p.x - center.x)
-    result.push({
-      angle,
-      speed: baseSpeed * (0.5 + Math.random() * 0.5),
-      color: variantColor(color, result.length, count),
-      life: baseLife * (0.7 + Math.random() * 0.5),
-    })
-  }
-  return result
+  return Array.from({ length: count }, (_, i) => {
+    const dv = dirVectors[Math.floor(Math.random() * dirVectors.length)]
+    return {
+      angle: dv.angle + (Math.random() - 0.5) * (Math.PI / 2),
+      speed: baseSpeed * (0.5 + Math.random() * 0.9),
+      color: variantColor(color, i, count),
+      life: baseLife * (0.8 + Math.random() * 0.4),
+    }
+  })
 }
 
 /**
- * Willow: initial upward burst then particles arc downward with high gravity.
- * Represented by angles biased toward the stroke's primary axis with a
- * downward skew — the fireworkEngine applies extra gravity for willow pattern.
+ * Outline: resample the stroke into `count` evenly-spaced target points.
+ * Each ParticleVector carries `targetX / targetY` (absolute canvas coords).
+ * The engine will use lerp-to-target for these particles instead of physics.
  */
+function outlineVectors(
+  stroke: Stroke,
+  burstCenter: { x: number; y: number },
+  count: number,
+  _baseSpeed: number,
+  color: string,
+  baseLife: number,
+): ParticleVector[] {
+  const targets = resampleUniform(stroke.points, count)
+  return targets.map((pt, i) => {
+    // angle and speed are still provided as fallback metadata
+    const angle = Math.atan2(pt.y - burstCenter.y, pt.x - burstCenter.x)
+    const d = dist2(burstCenter, pt)
+    return {
+      angle,
+      speed: Math.max(1, d / (baseLife * 0.5 * 0.4)), // speed needed to reach in 40% of life at baseLife
+      color: variantColor(color, i, count),
+      life: baseLife * (0.9 + Math.random() * 0.2),
+      targetX: pt.x,
+      targetY: pt.y,
+    }
+  })
+}
+
 function willowVectors(
   dirVectors: StrokeMetrics['directionVectors'],
   count: number,
@@ -260,171 +299,149 @@ function willowVectors(
     totalW += weight
   }
   const primaryAngle = totalW > 0 ? Math.atan2(sy / totalW, sx / totalW) : -Math.PI / 2
-  const spread = Math.PI * 0.6  // 108° fan
+  const spread = Math.PI * 0.6
 
   return Array.from({ length: count }, (_, i) => {
     const t = i / count
-    const angle = primaryAngle - spread / 2 + t * spread
     return {
-      angle,
+      angle: primaryAngle - spread / 2 + t * spread,
       speed: baseSpeed * (0.4 + Math.random() * 0.8),
       color: variantColor(color, i, count),
-      life: baseLife * (1.2 + Math.random() * 0.4), // willow hangs longer
+      life: baseLife * (1.2 + Math.random() * 0.4),
     }
   })
 }
 
-// ── Drawing-level analysis ────────────────────────────────────────────────────
+// ── Single-stroke blueprint ───────────────────────────────────────────────────
 
-/**
- * Merge all stroke metrics to determine:
- *  - dominant pattern (majority vote weighted by arc length)
- *  - overall speed, size, density
- */
-function mergeMetrics(strokes: Stroke[]): {
-  dominantPattern: FireworkPattern
-  avgSpeed: number
-  totalArc: number
-  totalPoints: number
-  allMetrics: StrokeMetrics[]
-} {
-  const allMetrics = strokes.map(measureStroke)
-  const totalArc = allMetrics.reduce((s, m) => s + m.arc, 0)
-  const totalPoints = strokes.reduce((s, st) => s + st.points.length, 0)
+function analyzeOneStroke(stroke: Stroke): FireworkBlueprint {
+  const m = measureStroke(stroke)
+  const pattern = classifyShape(stroke)
+  const color = stroke.color
 
-  const patternScore: Record<FireworkPattern, number> = {
-    sphere: 0, trail: 0, outline: 0, willow: 0,
+  const burstPoint = { x: m.center.x, y: m.center.y }
+  const launchPoint = burstPoint
+
+  const rawCount = Math.floor(40 + stroke.points.length * 0.4 + m.arc * 0.05)
+  const particleCount = Math.min(Math.max(rawCount, 50), 400)
+
+  const baseSpeed = Math.min(8, Math.max(1.5, m.avgSpeed * 3))
+  const baseLife = Math.round(Math.min(180, Math.max(60, 120 / Math.max(m.avgSpeed, 0.2))))
+  const duration = baseLife * (1000 / 60)
+
+  let particleVectors: ParticleVector[]
+
+  switch (pattern) {
+    case 'sphere':
+      particleVectors = sphereVectors(particleCount, baseSpeed, color, baseLife)
+      break
+    case 'trail':
+      particleVectors = trailVectors(m.directionVectors, particleCount, baseSpeed, color, baseLife)
+      break
+    case 'arc':
+      particleVectors = arcVectors(m.directionVectors, particleCount, baseSpeed, color, baseLife)
+      break
+    case 'outline':
+      particleVectors = outlineVectors(stroke, burstPoint, particleCount, baseSpeed, color, baseLife)
+      break
+    case 'willow':
+      particleVectors = willowVectors(m.directionVectors, particleCount, baseSpeed, color, baseLife)
+      break
   }
-  strokes.forEach((stroke, i) => {
-    const pattern = classifyShape(stroke)
-    // Weight by arc length so a tiny scribble doesn't override a big sweep
-    patternScore[pattern] += allMetrics[i].arc
-  })
-  const dominantPattern = (Object.entries(patternScore) as [FireworkPattern, number][])
-    .reduce((best, cur) => cur[1] > best[1] ? cur : best)[0]
 
-  const speedNumer = allMetrics.reduce((s, m) => s + m.avgSpeed * m.arc, 0)
-  const avgSpeed = totalArc > 0 ? speedNumer / totalArc : 1
+  return { launchPoint, burstPoint, particleVectors, pattern, duration }
+}
 
-  return { dominantPattern, avgSpeed, totalArc, totalPoints, allMetrics }
+// ── Grand finale ──────────────────────────────────────────────────────────────
+
+function makeFinaleBlueprint(
+  x: number,
+  y: number,
+  color: string,
+): FireworkBlueprint {
+  return {
+    launchPoint: { x, y },
+    burstPoint: { x, y },
+    particleVectors: sphereVectors(
+      60 + Math.floor(Math.random() * 40),
+      3 + Math.random() * 3,
+      color,
+      70 + Math.floor(Math.random() * 40),
+    ),
+    pattern: 'sphere',
+    duration: 1800,
+  }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Analyse a full Drawing (one or more strokes drawn by the user) and return
- * a FireworkBlueprint that the fireworkEngine can consume directly.
+ * Analyse a full multi-stroke Drawing and return a DrawingSequence.
+ *
+ * Each stroke becomes a timed shot (0.3–0.6 s apart).
+ * Strokes with < 8 points are treated as sphere bursts.
+ * Grand finale (5–8 mini sphere bursts) fires 500 ms after the last shot.
  */
-export function analyzeDrawing(drawing: Drawing): FireworkBlueprint {
-  const { strokes, bounds } = drawing
-  if (strokes.length === 0 || strokes.every(s => s.points.length < 2)) {
-    return fallbackBlueprint(drawing)
+export function analyzeDrawingSequence(drawing: Drawing): DrawingSequence {
+  const { strokes } = drawing
+  const validStrokes = strokes.filter(s => s.points.length >= 2)
+
+  if (validStrokes.length === 0) {
+    return { shots: [{ blueprint: fallbackBlueprint(drawing), delayMs: 0 }], grandFinale: [] }
   }
 
-  const { dominantPattern, avgSpeed, totalArc, totalPoints, allMetrics } =
-    mergeMetrics(strokes)
+  // Per-stroke shots with 0.3–0.6 s between each
+  let cumulativeDelay = 0
+  const shots: ScheduledBlueprint[] = validStrokes.map((stroke, i) => {
+    const delayMs = i === 0 ? 0 : cumulativeDelay
+    cumulativeDelay += 300 + Math.random() * 300
+    return { blueprint: analyzeOneStroke(stroke), delayMs }
+  })
 
-  // Burst at the visual centroid of the whole drawing
-  const burstPoint = {
-    x: (bounds.minX + bounds.maxX) / 2,
-    y: (bounds.minY + bounds.maxY) / 2,
-  }
+  // Grand finale — only when there are 2+ strokes
+  const grandFinale: ScheduledBlueprint[] = []
+  if (validStrokes.length >= 2) {
+    const finaleStart = cumulativeDelay + 500
+    const count = 5 + Math.floor(Math.random() * 4)   // 5–8
+    const vw = typeof window !== 'undefined' ? window.innerWidth : 900
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 700
 
-  // Launch from directly below the burst on the canvas bottom edge
-  const launchPoint = { x: burstPoint.x, y: burstPoint.y }
+    // Pick colors from the drawn strokes (cycle through them)
+    const colors = validStrokes.map(s => s.color)
 
-  // Base particle count: driven by density (point count) and size (arc)
-  const rawCount = Math.floor(
-    40 + totalPoints * 0.4 + totalArc * 0.05,
-  )
-  const particleCount = Math.min(Math.max(rawCount, 50), 400)
-
-  // Base speed: fast drawing → energetic burst; slow → gentle drift
-  //   avgSpeed is px/ms; typical range 0.1–3. Map to 1.5–8 px/frame.
-  const baseSpeed = Math.min(8, Math.max(1.5, avgSpeed * 3))
-
-  // Lifetime: inversely tied to speed (fast = shorter flash, slow = lingering)
-  const baseLife = Math.round(Math.min(180, Math.max(60, 120 / Math.max(avgSpeed, 0.2))))
-
-  // Duration: how long the whole firework animation runs (ms)
-  const duration = baseLife * (1000 / 60)  // convert frames → ms at 60fps
-
-  // Use primary stroke color (first stroke wins; multi-stroke gets first)
-  const primaryColor = strokes[0].color
-
-  // Build particle vectors based on pattern
-  let particleVectors: ParticleVector[]
-
-  switch (dominantPattern) {
-    case 'sphere':
-      particleVectors = sphereVectors(particleCount, baseSpeed, primaryColor, baseLife)
-      break
-
-    case 'trail': {
-      // Combine all direction vectors from all strokes
-      const allDirs = allMetrics.flatMap(m => m.directionVectors)
-      particleVectors = trailVectors(allDirs, particleCount, baseSpeed, primaryColor, baseLife)
-      break
-    }
-
-    case 'outline': {
-      // Use the largest stroke (by arc) as the outline template
-      const longestIdx = allMetrics.reduce(
-        (best, m, i) => m.arc > allMetrics[best].arc ? i : best, 0,
-      )
-      particleVectors = outlineVectors(
-        strokes[longestIdx],
-        allMetrics[longestIdx].center,
-        particleCount,
-        baseSpeed,
-        primaryColor,
-        baseLife,
-      )
-      break
-    }
-
-    case 'willow': {
-      const allDirs = allMetrics.flatMap(m => m.directionVectors)
-      particleVectors = willowVectors(allDirs, particleCount, baseSpeed, primaryColor, baseLife)
-      break
+    for (let i = 0; i < count; i++) {
+      const x = 80 + Math.random() * (vw - 160)
+      const y = 60 + Math.random() * (vh * 0.65)   // bias upper ⅔ of screen
+      grandFinale.push({
+        blueprint: makeFinaleBlueprint(x, y, colors[i % colors.length]),
+        delayMs: finaleStart + i * (120 + Math.random() * 80),  // 120–200 ms stagger
+      })
     }
   }
 
-  // If the drawing has multiple strokes with distinct colors, overlay their
-  // color contributions by patching a portion of the vectors
-  if (strokes.length > 1) {
-    let offset = 0
-    strokes.forEach((stroke, i) => {
-      const share = Math.floor(
-        particleVectors.length * (allMetrics[i].arc / Math.max(1, totalArc)),
-      )
-      for (let j = offset; j < Math.min(offset + share, particleVectors.length); j++) {
-        particleVectors[j].color = variantColor(stroke.color, j - offset, share)
-      }
-      offset += share
-    })
-  }
-
-  return { launchPoint, burstPoint, particleVectors, pattern: dominantPattern, duration }
+  return { shots, grandFinale }
 }
 
-/** Fallback for degenerate input (single dot, empty drawing) */
+/** Kept for backwards compatibility with any code that still calls this */
+export function analyzeDrawing(drawing: Drawing): FireworkBlueprint {
+  const seq = analyzeDrawingSequence(drawing)
+  return seq.shots[0]?.blueprint ?? fallbackBlueprint(drawing)
+}
+
 function fallbackBlueprint(drawing: Drawing): FireworkBlueprint {
-  const cx = (drawing.bounds.minX + drawing.bounds.maxX) / 2 || 0
-  const cy = (drawing.bounds.minY + drawing.bounds.maxY) / 2 || 0
+  const cx = (drawing.bounds.minX + drawing.bounds.maxX) / 2 || 400
+  const cy = (drawing.bounds.minY + drawing.bounds.maxY) / 2 || 300
   const color = drawing.strokes[0]?.color ?? '#ffffff'
   return {
     launchPoint: { x: cx, y: cy },
-    burstPoint:  { x: cx, y: cy },
+    burstPoint: { x: cx, y: cy },
     particleVectors: sphereVectors(60, 3, color, 90),
     pattern: 'sphere',
     duration: 1500,
   }
 }
 
-// ── Legacy single-stroke API (keeps FireworkCanvas working unchanged) ─────────
-
-import type { StrokeAnalysis } from './types'
+// ── Legacy single-stroke API ──────────────────────────────────────────────────
 
 export function analyzeStroke(stroke: Stroke): StrokeAnalysis {
   const { points } = stroke
@@ -432,21 +449,16 @@ export function analyzeStroke(stroke: Stroke): StrokeAnalysis {
     const p = points[0] ?? { x: 0, y: 0, t: 0 }
     return { length: 0, angle: -90, speed: 0, curvature: 0, launchPoint: p, burstPoint: p }
   }
-
   const first = points[0]
   const last = points[points.length - 1]
   const arc = arcLength(points)
-  const angle = Math.atan2(last.y - first.y, last.x - first.x) * (180 / Math.PI)
-  const elapsedMs = Math.max(1, last.t - first.t)
   const m = measureStroke(stroke)
-
   const launchPoint = first.y >= last.y ? first : last
   const burstPoint = first.y >= last.y ? last : first
-
   return {
     length: arc,
-    angle,
-    speed: arc / elapsedMs,
+    angle: Math.atan2(last.y - first.y, last.x - first.x) * (180 / Math.PI),
+    speed: arc / Math.max(1, last.t - first.t),
     curvature: m.curvature,
     launchPoint,
     burstPoint,

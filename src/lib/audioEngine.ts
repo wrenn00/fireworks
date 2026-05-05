@@ -1,16 +1,41 @@
-// Web Audio API synthesis — no external files.
-// AudioContext is created lazily on first call (requires a user gesture to unlock).
+/**
+ * Web Audio API sound synthesis — zero external files.
+ *
+ * Global mute is stored in module scope so it survives re-renders.
+ * Call setMuted(true/false) to toggle; isMuted() to read the state.
+ */
+
+// ── AudioContext (lazy, unlocked on first user gesture) ───────────────────────
 
 let ac: AudioContext | null = null
+let masterGain: GainNode | null = null
+let muted = false
 
-function getAc(): AudioContext {
-  if (!ac) ac = new AudioContext()
-  // Resume if suspended (browser autoplay policy)
+function getAc(): { ctx: AudioContext; out: GainNode } {
+  if (!ac) {
+    ac = new AudioContext()
+    masterGain = ac.createGain()
+    masterGain.gain.value = muted ? 0 : 1
+    masterGain.connect(ac.destination)
+  }
   if (ac.state === 'suspended') ac.resume()
-  return ac
+  return { ctx: ac, out: masterGain! }
 }
 
-function noise(ctx: AudioContext, durationSec: number): AudioBufferSourceNode {
+// ── Mute control ──────────────────────────────────────────────────────────────
+
+export function setMuted(value: boolean): void {
+  muted = value
+  if (masterGain) masterGain.gain.setTargetAtTime(value ? 0 : 1, ac!.currentTime, 0.02)
+}
+
+export function isMuted(): boolean {
+  return muted
+}
+
+// ── Noise source ──────────────────────────────────────────────────────────────
+
+function noiseSource(ctx: AudioContext, durationSec: number): AudioBufferSourceNode {
   const len = Math.floor(ctx.sampleRate * durationSec)
   const buf = ctx.createBuffer(1, len, ctx.sampleRate)
   const data = buf.getChannelData(0)
@@ -20,104 +45,129 @@ function noise(ctx: AudioContext, durationSec: number): AudioBufferSourceNode {
   return src
 }
 
+// ── Whoosh ────────────────────────────────────────────────────────────────────
+
 /**
- * Whoosh — rising bandpass-filtered noise sweep.
- * intensity 0–1: louder + higher pitch + longer duration.
+ * Downward-swept lowpass noise: 2000 Hz → 200 Hz in 0.4 s.
+ * intensity 0–1 scales volume and starting frequency.
  */
 export function playWhoosh(intensity: number): void {
   try {
-    const ctx = getAc()
-    const dur = 0.35 + intensity * 0.35
+    const { ctx, out } = getAc()
+    const dur = 0.38 + intensity * 0.12   // 0.38–0.5 s
 
-    const src = noise(ctx, dur)
+    const src = noiseSource(ctx, dur)
 
-    const filter = ctx.createBiquadFilter()
-    filter.type = 'bandpass'
-    filter.Q.value = 4
-    filter.frequency.setValueAtTime(150 + intensity * 100, ctx.currentTime)
-    filter.frequency.exponentialRampToValueAtTime(
-      1800 + intensity * 2500,
-      ctx.currentTime + dur,
-    )
+    // Lowpass swept downward (missile falling)
+    const lp = ctx.createBiquadFilter()
+    lp.type = 'lowpass'
+    lp.Q.value = 2.5
+    lp.frequency.setValueAtTime(1800 + intensity * 1200, ctx.currentTime)
+    lp.frequency.exponentialRampToValueAtTime(200, ctx.currentTime + 0.4)
 
     const gain = ctx.createGain()
     gain.gain.setValueAtTime(0, ctx.currentTime)
-    gain.gain.linearRampToValueAtTime(0.12 + intensity * 0.22, ctx.currentTime + 0.04)
+    gain.gain.linearRampToValueAtTime(0.15, ctx.currentTime + 0.03)
     gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur)
 
-    src.connect(filter)
-    filter.connect(gain)
-    gain.connect(ctx.destination)
+    src.connect(lp)
+    lp.connect(gain)
+    gain.connect(out)
     src.start(ctx.currentTime)
     src.stop(ctx.currentTime + dur)
-  } catch {
-    // Silently ignore if AudioContext is unavailable (e.g. blocked by policy)
-  }
+  } catch { /* silently ignore */ }
 }
 
+// ── Boom ──────────────────────────────────────────────────────────────────────
+
 /**
- * Boom — sub-bass pitch-drop + high-freq crack.
- * intensity 0–1: louder + lower fundamental + more crackling overtones.
+ * Explosion: sine sub-bass + bandpass noise burst.
+ *
+ * intensity 0–1:
+ *  - sine frequency: 60–90 Hz
+ *  - sine gain:      0.4 (fades in 0.3 s)
+ *  - noise gain:     0.2 (fades in 0.5 s)
+ *  - noise bandpass: 800 Hz centred (± intensity spread)
  */
 export function playBoom(intensity: number): void {
   try {
-    const ctx = getAc()
+    const { ctx, out } = getAc()
+    const now = ctx.currentTime
 
-    // Sub-bass: sine oscillator falling from ~80Hz to inaudible
+    // ── Sine sub-bass ─────────────────────────────────────────────────────
+    const sineFreq = 60 + intensity * 30   // 60–90 Hz
     const osc = ctx.createOscillator()
     osc.type = 'sine'
-    const startFreq = 55 + intensity * 65
-    osc.frequency.setValueAtTime(startFreq, ctx.currentTime)
-    osc.frequency.exponentialRampToValueAtTime(18, ctx.currentTime + 0.6)
+    osc.frequency.setValueAtTime(sineFreq, now)
+    // Short pitch drop for impact
+    osc.frequency.exponentialRampToValueAtTime(sineFreq * 0.3, now + 0.3)
 
-    const oscGain = ctx.createGain()
-    oscGain.gain.setValueAtTime(0.5 + intensity * 0.45, ctx.currentTime)
-    oscGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.75)
+    const sineGain = ctx.createGain()
+    sineGain.gain.setValueAtTime(0.4 * (0.6 + intensity * 0.4), now)
+    sineGain.gain.exponentialRampToValueAtTime(0.001, now + 0.3)
 
-    osc.connect(oscGain)
-    oscGain.connect(ctx.destination)
-    osc.start(ctx.currentTime)
-    osc.stop(ctx.currentTime + 0.75)
+    osc.connect(sineGain)
+    sineGain.connect(out)
+    osc.start(now)
+    osc.stop(now + 0.31)
 
-    // Crack: short burst of high-passed noise
-    const crackDur = 0.06 + intensity * 0.04
-    const crack = noise(ctx, crackDur)
+    // ── Bandpass noise burst ──────────────────────────────────────────────
+    const noiseDur = 0.5
+    const nSrc = noiseSource(ctx, noiseDur)
 
-    const hp = ctx.createBiquadFilter()
-    hp.type = 'highpass'
-    hp.frequency.value = 900 + intensity * 600
+    const bp = ctx.createBiquadFilter()
+    bp.type = 'bandpass'
+    bp.frequency.setValueAtTime(800 + intensity * 400, now)
+    bp.Q.value = 1.5 + intensity * 1.5
 
-    const crackGain = ctx.createGain()
-    crackGain.gain.setValueAtTime(0.25 + intensity * 0.3, ctx.currentTime)
-    crackGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + crackDur)
+    const noiseGain = ctx.createGain()
+    noiseGain.gain.setValueAtTime(0.2 * (0.5 + intensity * 0.5), now)
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDur)
 
-    crack.connect(hp)
-    hp.connect(crackGain)
-    crackGain.connect(ctx.destination)
-    crack.start(ctx.currentTime)
-    crack.stop(ctx.currentTime + crackDur)
+    nSrc.connect(bp)
+    bp.connect(noiseGain)
+    noiseGain.connect(out)
+    nSrc.start(now)
+    nSrc.stop(now + noiseDur)
 
-    // Shimmer: mid-range noise tail (simulates particle hiss)
-    if (intensity > 0.3) {
-      const shimDur = 0.5 + intensity * 0.6
-      const shim = noise(ctx, shimDur)
+    // ── Crackle tail (타닥타닥) ───────────────────────────────────────────
+    playCrackle(intensity)
+  } catch { /* silently ignore */ }
+}
 
-      const bp = ctx.createBiquadFilter()
-      bp.type = 'bandpass'
-      bp.frequency.value = 3000 + intensity * 2000
-      bp.Q.value = 1.5
+// ── Crackle ───────────────────────────────────────────────────────────────────
 
-      const shimGain = ctx.createGain()
-      shimGain.gain.setValueAtTime(0.05 + intensity * 0.08, ctx.currentTime)
-      shimGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + shimDur)
+/**
+ * 5–12 short noise bursts scattered 0.3–1.5 s after the boom.
+ * Each burst: ~30 ms, gain 0.05–0.1, highpass-filtered snap.
+ */
+export function playCrackle(intensity: number): void {
+  try {
+    const { ctx, out } = getAc()
+    const burstCount = 5 + Math.floor(Math.random() * 8)   // 5–12
 
-      shim.connect(bp)
-      bp.connect(shimGain)
-      shimGain.connect(ctx.destination)
-      shim.start(ctx.currentTime)
-      shim.stop(ctx.currentTime + shimDur)
+    for (let i = 0; i < burstCount; i++) {
+      const delay  = 0.3 + Math.random() * 1.2              // 0.3–1.5 s
+      const dur    = 0.02 + Math.random() * 0.015           // 20–35 ms
+      const vol    = 0.05 + Math.random() * 0.055           // 0.05–0.105
+      const freq   = 1500 + Math.random() * 3000            // 1.5–4.5 kHz snap
+      const when   = ctx.currentTime + delay
+
+      const nSrc = noiseSource(ctx, dur + 0.01)
+
+      const hp = ctx.createBiquadFilter()
+      hp.type = 'highpass'
+      hp.frequency.value = freq
+
+      const g = ctx.createGain()
+      g.gain.setValueAtTime(vol * (0.6 + intensity * 0.4), when)
+      g.gain.exponentialRampToValueAtTime(0.001, when + dur)
+
+      nSrc.connect(hp)
+      hp.connect(g)
+      g.connect(out)
+      nSrc.start(when)
+      nSrc.stop(when + dur + 0.01)
     }
-  } catch {
-    // Silently ignore
-  }
+  } catch { /* silently ignore */ }
 }
