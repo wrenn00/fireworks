@@ -475,8 +475,8 @@ function resampleWithTime(points: Point[], n: number): SampledPoint[] {
 /** Convert raw sample timestamps to delays (ms from 0), clamping per-gap to [minGap, maxGap] */
 function computeDelays(
   samples: SampledPoint[],
-  minGap = 80,    // slow enough that each small burst is individually visible
-  maxGap = 150,   // keeps the sequence flowing without long gaps
+  minGap = 100,   // enough time to see each ray firework pop distinctly
+  maxGap = 200,   // don't let slow-drawn strokes drag too long
 ): number[] {
   if (samples.length === 0) return []
   const result = [0]
@@ -516,7 +516,8 @@ function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBur
   // 12–20 bursts per stroke.
   // Dense enough to trace the line; sparse enough that adjacent small bursts
   // don't merge into one blob (one burst every ~50 px of arc).
-  const n = Math.max(12, Math.min(20, Math.round(arc / 50)))
+  // 8–15 bursts per stroke — each a distinct ray firework (one every ~55px)
+  const n = Math.max(8, Math.min(15, Math.round(arc / 55)))
 
   const samples = resampleWithTime(stroke.points, n)
   const delays  = computeDelays(samples)
