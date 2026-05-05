@@ -419,6 +419,53 @@ export function createSmallBurst(
   return { id: nextId++, particles, alive: true }
 }
 
+// ── Full-size burst (primary path-playback system) ────────────────────────────
+
+/**
+ * One spectacular firework burst at (x, y).
+ * 200–400 particles, speed 8–16, three size tiers — the same visual richness
+ * as a real firework.  Burst positions come from the user's drawn path, so the
+ * shape is recognisable without needing any persistent afterglow dots.
+ */
+export function createFullBurst(x: number, y: number, color: string): Firework {
+  const count = 200 + Math.floor(Math.random() * 200)  // 200–400
+
+  const particles: Particle[] = Array.from({ length: count }, () => {
+    // Size tiers: 20 % large, 50 % medium, 30 % small
+    const rSize = Math.random()
+    const size  = rSize < 0.20 ? 3.5 + Math.random() * 1.5
+                : rSize < 0.70 ? 1.8 + Math.random() * 1.2
+                :                0.5 + Math.random() * 1.0
+
+    // Speed: 80 % fast (8–16), 20 % slow drifters (2–6)
+    const speed = Math.random() < 0.80
+      ? 8  + Math.random() * 8
+      : 2  + Math.random() * 4
+
+    const angle   = Math.random() * Math.PI * 2
+    const maxLife = 100 + Math.floor(Math.random() * 80)   // 100–180 frames
+    const isSeed  = Math.random() < SEED_RATE
+    const delay   = SEED_DELAY_MIN + Math.floor(Math.random() * (SEED_DELAY_MAX - SEED_DELAY_MIN))
+
+    return {
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      alpha: 1,
+      color: getParticleColor(color),
+      size,
+      gravity: (0.05 + Math.random() * 0.04) * (0.6 + Math.random() * 0.8),
+      life: maxLife,
+      maxLife,
+      trail: [],
+      decay: 0,
+      secondaryAt: isSeed ? maxLife - delay : undefined,
+    }
+  })
+
+  return { id: nextId++, particles, alive: true }
+}
+
 /** Legacy shim — kept for code paths that haven't migrated to WorldState */
 export function tickFireworks(fireworks: Firework[]): Firework[] {
   return tickWorld({ fireworks, flashes: [], globalGlowAlpha: 0 }).fireworks

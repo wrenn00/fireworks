@@ -475,8 +475,8 @@ function resampleWithTime(points: Point[], n: number): SampledPoint[] {
 /** Convert raw sample timestamps to delays (ms from 0), clamping per-gap to [minGap, maxGap] */
 function computeDelays(
   samples: SampledPoint[],
-  minGap = 60,
-  maxGap = 250,
+  minGap = 150,   // minimum gap between bursts — enough to see each explosion
+  maxGap = 300,   // maximum gap — keeps the sequence snappy
 ): number[] {
   if (samples.length === 0) return []
   const result = [0]
@@ -513,8 +513,9 @@ function burstSizeForStroke(strokeWidth: number): BurstSize {
  */
 function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBurst[] {
   const arc = arcLength(stroke.points)
-  // 8–30 bursts depending on stroke length (one burst every ~25px)
-  const n = Math.max(8, Math.min(30, Math.round(arc / 25)))
+  // 6–12 bursts per stroke — sparse enough that each big explosion is visible
+  // and the shape is recognisable from the pattern of detonations.
+  const n = Math.max(6, Math.min(12, Math.round(arc / 60)))
 
   const samples = resampleWithTime(stroke.points, n)
   const delays  = computeDelays(samples)
@@ -527,7 +528,7 @@ function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBur
     globalDelay:   timeOffset + delays[i],
     color:         colors[i],
     size,
-    trailDuration: 400 + Math.random() * 300,  // 400–700 ms
+    trailDuration: 500 + Math.random() * 300,  // 500–800 ms ascent
   }))
 }
 
@@ -535,13 +536,14 @@ function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBur
  * Build a full DrawingPlayback from all strokes in a Drawing.
  *
  * Layout:
- *   stroke 0 bursts → 800 ms gap → stroke 1 bursts → … →
- *   2000 ms gap → grand finale (subset of all burst positions re-fired small)
+ *   stroke 0 bursts (6–12 big explosions) →
+ *   800 ms gap →
+ *   stroke 1 bursts → … →
+ *   1000 ms pause → grand finale (5–8 big bursts, random screen positions)
  */
 export function buildDrawingPlayback(drawing: Drawing): DrawingPlayback {
-  const STROKE_GAP_MS  = 800
-  const FINALE_GAP_MS  = 2000
-  const FINALE_MAX     = 50   // cap finale bursts for perf
+  const STROKE_GAP_MS = 800
+  const FINALE_GAP_MS = 1000   // 1 s pause before finale
 
   const regularBursts: PlaybackBurst[] = []
   let timeOffset = 0
@@ -556,19 +558,21 @@ export function buildDrawingPlayback(drawing: Drawing): DrawingPlayback {
 
   const lastRegularDelay = regularBursts[regularBursts.length - 1]?.globalDelay ?? 0
 
-  // Grand finale: re-fire a subset of all burst positions simultaneously
-  const finaleStart = lastRegularDelay + FINALE_GAP_MS
-  const step = Math.max(1, Math.floor(regularBursts.length / FINALE_MAX))
-  const finaleBursts: PlaybackBurst[] = regularBursts
-    .filter((_, i) => i % step === 0)
-    .map(b => ({
-      x: b.x,
-      y: b.y,
-      globalDelay:   finaleStart + Math.random() * 300,   // slight stagger
-      color:         b.color,
-      size:          'small' as BurstSize,
-      trailDuration: 200 + Math.random() * 200,           // shorter trails
-    }))
+  // Grand finale: 5–8 big fireworks at random positions across the viewport
+  const finaleStart  = lastRegularDelay + FINALE_GAP_MS
+  const finaleCount  = 5 + Math.floor(Math.random() * 4)   // 5–8
+  const vw = typeof window !== 'undefined' ? window.innerWidth  : 900
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 700
+  const strokeColors = drawing.strokes.map(s => s.color)
+
+  const finaleBursts: PlaybackBurst[] = Array.from({ length: finaleCount }, (_, i) => ({
+    x: 80 + Math.random() * (vw - 160),
+    y: 60 + Math.random() * (vh * 0.65),
+    globalDelay:   finaleStart + i * (100 + Math.random() * 150),   // near-simultaneous
+    color:         strokeColors[i % strokeColors.length] ?? '#ffffff',
+    size:          'large' as BurstSize,   // full-size bursts for the finale
+    trailDuration: 500 + Math.random() * 300,
+  }))
 
   const allBursts = [...regularBursts, ...finaleBursts]
     .sort((a, b) => a.globalDelay - b.globalDelay)
