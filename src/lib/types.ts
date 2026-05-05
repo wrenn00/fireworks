@@ -86,6 +86,33 @@ export interface DrawingControls {
   lineWidth: number
 }
 
+// ── Drawing-path playback (new primary system) ────────────────────────────────
+
+export type BurstSize = 'small' | 'medium' | 'large'
+
+/**
+ * A single small explosion placed along the user's drawn path.
+ * Coordinates are absolute canvas pixels matching the drawing canvas.
+ */
+export interface PlaybackBurst {
+  x: number
+  y: number
+  globalDelay: number   // ms from playback start → when the burst fires
+  color: string
+  size: BurstSize
+  trailDuration: number // ms for the ascending trail (pre-computed)
+}
+
+/**
+ * Full playback description for one Drawing (all strokes + grand finale).
+ * Passed to FireworkCanvas; replaces the old DrawingSequence.
+ */
+export interface DrawingPlayback {
+  bursts: PlaybackBurst[]   // sorted by globalDelay; includes finale bursts
+  lastBurstDelay: number    // ms of the last regular (non-finale) burst
+                            // used to set afterglow holdUntil timing
+}
+
 // ── Firework blueprint ────────────────────────────────────────────────────────
 
 export type FireworkPattern = 'sphere' | 'trail' | 'outline' | 'willow' | 'arc'

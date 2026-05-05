@@ -8,6 +8,9 @@ import type {
   DrawingSequence,
   ScheduledBlueprint,
   StrokeAnalysis,
+  BurstSize,
+  PlaybackBurst,
+  DrawingPlayback,
 } from './types'
 
 // ── Low-level geometry ────────────────────────────────────────────────────────
@@ -439,6 +442,143 @@ function fallbackBlueprint(drawing: Drawing): FireworkBlueprint {
     pattern: 'sphere',
     duration: 1500,
   }
+}
+
+// ── Path-based playback system (primary) ─────────────────────────────────────
+
+interface SampledPoint { x: number; y: number; t: number }
+
+/** Resample stroke points to exactly n positions with interpolated timestamps */
+function resampleWithTime(points: Point[], n: number): SampledPoint[] {
+  if (points.length === 0) return []
+  if (n <= 1) return [{ x: points[0].x, y: points[0].y, t: points[0].t }]
+
+  const cum = [0]
+  for (let i = 1; i < points.length; i++) cum.push(cum[i - 1] + dist2(points[i - 1], points[i]))
+  const total = cum[cum.length - 1]
+  if (total === 0) return Array.from({ length: n }, () => ({ ...points[0] }))
+
+  return Array.from({ length: n }, (_, k) => {
+    const target = (k / (n - 1)) * total
+    let lo = 0, hi = cum.length - 1
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (cum[mid] <= target) lo = mid; else hi = mid }
+    const seg = cum[hi] - cum[lo]
+    const frac = seg > 0 ? (target - cum[lo]) / seg : 0
+    return {
+      x: points[lo].x + (points[hi].x - points[lo].x) * frac,
+      y: points[lo].y + (points[hi].y - points[lo].y) * frac,
+      t: points[lo].t  + (points[hi].t  - points[lo].t)  * frac,
+    }
+  })
+}
+
+/** Convert raw sample timestamps to delays (ms from 0), clamping per-gap to [minGap, maxGap] */
+function computeDelays(
+  samples: SampledPoint[],
+  minGap = 60,
+  maxGap = 250,
+): number[] {
+  if (samples.length === 0) return []
+  const result = [0]
+  for (let i = 1; i < samples.length; i++) {
+    const raw = samples[i].t - samples[i - 1].t
+    const gap = Math.max(minGap, Math.min(maxGap, isFinite(raw) && raw > 0 ? raw : minGap))
+    result.push(result[result.length - 1] + gap)
+  }
+  return result
+}
+
+/**
+ * Gentle hue gradient ±10° across n bursts.
+ * Small enough that the color reads as the same hue the user chose,
+ * but adds subtle life to long strokes.
+ */
+function burstColors(baseColor: string, n: number): string[] {
+  return Array.from({ length: n }, (_, i) => {
+    const t   = n > 1 ? i / (n - 1) : 0
+    const deg = (t - 0.5) * 20  // −10° → +10° (was ±30°)
+    return shiftHue(baseColor, deg)
+  })
+}
+
+function burstSizeForStroke(strokeWidth: number): BurstSize {
+  if (strokeWidth >= 10) return 'large'
+  if (strokeWidth >= 4)  return 'medium'
+  return 'small'
+}
+
+/**
+ * Convert a single Stroke into a sorted list of PlaybackBursts.
+ * `timeOffset` shifts all delays so strokes play back-to-back.
+ */
+function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBurst[] {
+  const arc = arcLength(stroke.points)
+  // 8–30 bursts depending on stroke length (one burst every ~25px)
+  const n = Math.max(8, Math.min(30, Math.round(arc / 25)))
+
+  const samples = resampleWithTime(stroke.points, n)
+  const delays  = computeDelays(samples)
+  const colors  = burstColors(stroke.color, n)
+  const size    = burstSizeForStroke(stroke.width)
+
+  return samples.map((s, i) => ({
+    x: s.x,
+    y: s.y,
+    globalDelay:   timeOffset + delays[i],
+    color:         colors[i],
+    size,
+    trailDuration: 400 + Math.random() * 300,  // 400–700 ms
+  }))
+}
+
+/**
+ * Build a full DrawingPlayback from all strokes in a Drawing.
+ *
+ * Layout:
+ *   stroke 0 bursts → 800 ms gap → stroke 1 bursts → … →
+ *   2000 ms gap → grand finale (subset of all burst positions re-fired small)
+ */
+export function buildDrawingPlayback(drawing: Drawing): DrawingPlayback {
+  const STROKE_GAP_MS  = 800
+  const FINALE_GAP_MS  = 2000
+  const FINALE_MAX     = 50   // cap finale bursts for perf
+
+  const regularBursts: PlaybackBurst[] = []
+  let timeOffset = 0
+
+  for (const stroke of drawing.strokes) {
+    if (stroke.points.length < 2) continue
+    const bursts = strokeToPlaybackBursts(stroke, timeOffset)
+    regularBursts.push(...bursts)
+    const strokeEnd = bursts[bursts.length - 1]?.globalDelay ?? timeOffset
+    timeOffset = strokeEnd + STROKE_GAP_MS
+  }
+
+  const lastRegularDelay = regularBursts[regularBursts.length - 1]?.globalDelay ?? 0
+
+  // Grand finale: re-fire a subset of all burst positions simultaneously
+  const finaleStart = lastRegularDelay + FINALE_GAP_MS
+  const step = Math.max(1, Math.floor(regularBursts.length / FINALE_MAX))
+  const finaleBursts: PlaybackBurst[] = regularBursts
+    .filter((_, i) => i % step === 0)
+    .map(b => ({
+      x: b.x,
+      y: b.y,
+      globalDelay:   finaleStart + Math.random() * 300,   // slight stagger
+      color:         b.color,
+      size:          'small' as BurstSize,
+      trailDuration: 200 + Math.random() * 200,           // shorter trails
+    }))
+
+  const allBursts = [...regularBursts, ...finaleBursts]
+    .sort((a, b) => a.globalDelay - b.globalDelay)
+
+  console.log(
+    `[strokeAnalyzer] DrawingPlayback: ${regularBursts.length} regular + `+
+    `${finaleBursts.length} finale bursts, lastRegular=${lastRegularDelay}ms`,
+  )
+
+  return { bursts: allBursts, lastBurstDelay: lastRegularDelay }
 }
 
 // ── Legacy single-stroke API ──────────────────────────────────────────────────

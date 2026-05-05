@@ -1,52 +1,170 @@
+/**
+ * FireworkCanvas
+ *
+ * Receives a DrawingPlayback (list of timed bursts along the user's drawn path).
+ * For each burst it:
+ *   1. Launches an ascending bezier trail from the bottom of the screen.
+ *   2. On arrival: fires a small particle burst + creates a persistent afterglow dot.
+ * After the last burst the afterglows hold for 1.5 s, then fade over 3 s.
+ */
 import { useRef, useEffect, useCallback, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import GIF from 'gif.js'
 import gifWorkerUrl from 'gif.js/dist/gif.worker.js?url'
-import type { WorldState, DrawingSequence, ScheduledBlueprint, FireworkPattern } from '../lib/types'
-import { createWorldState, tickWorld, drawWorld } from '../lib/fireworkEngine'
+import type { DrawingPlayback, PlaybackBurst } from '../lib/types'
+import { createSmallBurst, tickFireworks, drawFireworks } from '../lib/fireworkEngine'
 import { playBoom } from '../lib/audioEngine'
 
 interface Props {
-  sequence: DrawingSequence | null
+  playback: DrawingPlayback | null
   onFinished: () => void
-  /** Called once when the first shot fires, with the primary pattern */
-  onPatternDetected?: (pattern: FireworkPattern) => void
+}
+
+// ── Local simulation types ────────────────────────────────────────────────────
+
+interface ActiveTrail {
+  p0: { x: number; y: number }   // launch point (bottom of canvas)
+  p1: { x: number; y: number }   // bezier control point
+  p2: { x: number; y: number }   // burst destination
+  color: string
+  startTime: number               // perf.now() when trail was spawned
+  duration: number                // ms for the ascent
+  burst: PlaybackBurst            // fired when trail arrives
+  done: boolean
+}
+
+interface Afterglow {
+  x: number; y: number
+  color: string
+  baseRadius: number              // 4–8 px
+  alpha: number                   // current display alpha (re-computed each frame)
+  phase: number                   // sin pulse offset
+  holdUntil: number               // perf.now() — don't fade before this
+  fadeDuration: number            // ms for the alpha 1→0 fade
+}
+
+// ── Bezier helper ─────────────────────────────────────────────────────────────
+
+function quadBez(
+  p0: { x: number; y: number },
+  p1: { x: number; y: number },
+  p2: { x: number; y: number },
+  t: number,
+): { x: number; y: number } {
+  const mt = 1 - t
+  return {
+    x: mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x,
+    y: mt * mt * p0.y + 2 * mt * t * p1.y + t * t * p2.y,
+  }
+}
+
+// ── Trail rendering ───────────────────────────────────────────────────────────
+
+function drawTrail(
+  ctx: CanvasRenderingContext2D,
+  trail: ActiveTrail,
+  now: number,
+) {
+  const elapsed = now - trail.startTime
+  const t = Math.min(1, elapsed / trail.duration)
+  const TAIL = 0.14   // fraction of path that makes the tail
+
+  ctx.fillStyle  = trail.color
+  ctx.shadowColor = trail.color
+
+  // Fading tail dots (oldest → transparent, head → bright)
+  const steps = 14
+  for (let i = 0; i <= steps; i++) {
+    const frac = i / steps                             // 0=oldest, 1=head
+    const ti   = Math.max(0, t - TAIL + frac * TAIL)
+    const pos  = quadBez(trail.p0, trail.p1, trail.p2, ti)
+    ctx.globalAlpha = frac * 0.75
+    ctx.shadowBlur  = frac * 8
+    const r = 0.4 + frac * 1.6
+    ctx.beginPath()
+    ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  // Bright head
+  const head = quadBez(trail.p0, trail.p1, trail.p2, t)
+  ctx.globalAlpha = 1
+  ctx.shadowBlur  = 18
+  ctx.beginPath()
+  ctx.arc(head.x, head.y, 2.8, 0, Math.PI * 2)
+  ctx.fill()
+
+  ctx.globalAlpha = 1
+  ctx.shadowBlur  = 0
+}
+
+// ── Afterglow rendering ───────────────────────────────────────────────────────
+
+/** Returns false when the afterglow has fully faded and can be removed. */
+function drawAfterglow(
+  ctx: CanvasRenderingContext2D,
+  ag: Afterglow,
+  now: number,
+): boolean {
+  let alpha = ag.alpha
+  if (now > ag.holdUntil) {
+    const fadeT = (now - ag.holdUntil) / ag.fadeDuration
+    alpha = Math.max(0, 1 - fadeT) * ag.alpha
+  }
+  if (alpha < 0.005) return false
+
+  // Gentle pulse
+  const pulse = 1 + 0.09 * Math.sin(now * 0.0038 + ag.phase)
+  const r     = ag.baseRadius * pulse
+
+  ctx.globalAlpha  = alpha
+  ctx.fillStyle    = ag.color
+  ctx.shadowColor  = ag.color
+  ctx.shadowBlur   = r * 5
+  ctx.beginPath()
+  ctx.arc(ag.x, ag.y, r, 0, Math.PI * 2)
+  ctx.fill()
+
+  ctx.globalAlpha = 1
+  ctx.shadowBlur  = 0
+  return true
 }
 
 // ── Star field ────────────────────────────────────────────────────────────────
-
-const STAR_COLORS = ['#ffffff', '#ffffff', '#ffffff', '#fffde4', '#eeeeff']
 
 interface Star {
   x: number; y: number
   radius: number
   baseAlpha: number
-  phaseOffset: number
+  phase: number
   speed: number
 }
 
-function generateStars(count = 200): Star[] {
-  return Array.from({ length: count }, () => ({
+function generateStars(n = 200): Star[] {
+  return Array.from({ length: n }, () => ({
     x: Math.random(), y: Math.random(),
-    radius: Math.random() < 0.01 ? 1.5 : 0.5 + Math.random() * 0.5,
+    radius:    Math.random() < 0.01 ? 1.5 : 0.5 + Math.random() * 0.5,
     baseAlpha: 0.35 + Math.random() * 0.35,
-    phaseOffset: Math.random() * Math.PI * 2,
-    speed: 0.01 + Math.random() * 0.025,
+    phase:     Math.random() * Math.PI * 2,
+    speed:     0.01 + Math.random() * 0.025,
   }))
 }
 
+const STAR_COLORS = ['#ffffff', '#ffffff', '#ffffff', '#fffde4', '#eeeeff']
+
 function drawStars(
   ctx: CanvasRenderingContext2D,
-  stars: Star[], frame: number, w: number, h: number, brightnessMult = 1,
+  stars: Star[], frame: number, w: number, h: number,
+  brightMult = 1,
 ) {
   ctx.shadowBlur = 0
   for (const s of stars) {
-    const alpha = Math.max(0, Math.min(1,
-      (s.baseAlpha + Math.sin(frame * s.speed + s.phaseOffset) * 0.28) * brightnessMult,
+    const a = Math.max(0, Math.min(1,
+      (s.baseAlpha + Math.sin(frame * s.speed + s.phase) * 0.28) * brightMult,
     ))
-    if (alpha < 0.01) continue
-    ctx.globalAlpha = alpha
-    ctx.fillStyle = STAR_COLORS[Math.floor(Math.random() * STAR_COLORS.length)]
+    if (a < 0.01) continue
+    ctx.globalAlpha = a
+    ctx.fillStyle   = STAR_COLORS[Math.floor(Math.random() * STAR_COLORS.length)]
     ctx.beginPath()
     ctx.arc(s.x * w, s.y * h, s.radius, 0, Math.PI * 2)
     ctx.fill()
@@ -56,81 +174,91 @@ function drawStars(
 
 function drawVignette(ctx: CanvasRenderingContext2D, w: number, h: number) {
   const cx = w / 2, cy = h / 2
-  const r = Math.max(w, h) * 0.72
-  const grad = ctx.createRadialGradient(cx, cy, r * 0.35, cx, cy, r)
-  grad.addColorStop(0, 'rgba(0,0,0,0)')
-  grad.addColorStop(1, 'rgba(0,0,0,0.30)')
-  ctx.fillStyle = grad
+  const r  = Math.max(w, h) * 0.72
+  const g  = ctx.createRadialGradient(cx, cy, r * 0.35, cx, cy, r)
+  g.addColorStop(0, 'rgba(0,0,0,0)')
+  g.addColorStop(1, 'rgba(0,0,0,0.30)')
   ctx.globalAlpha = 1
-  ctx.shadowBlur = 0
+  ctx.shadowBlur  = 0
+  ctx.fillStyle   = g
   ctx.fillRect(0, 0, w, h)
-}
-
-// ── Merge a new WorldState into an existing one ───────────────────────────────
-
-function mergeWorld(base: WorldState, incoming: WorldState): WorldState {
-  return {
-    fireworks: [...base.fireworks, ...incoming.fireworks],
-    flashes:   [...base.flashes,   ...incoming.flashes],
-    globalGlowAlpha: Math.max(base.globalGlowAlpha, incoming.globalGlowAlpha),
-  }
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function FireworkCanvas({ sequence, onFinished, onPatternDetected }: Props) {
+export default function FireworkCanvas({ playback, onFinished }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const worldRef  = useRef<WorldState>({ fireworks: [], flashes: [], globalGlowAlpha: 0 })
-  const rafRef    = useRef<number>(0)
-  const finishedRef = useRef(false)
+
+  // Particle world (small burst physics)
+  type FWArray = ReturnType<typeof createSmallBurst>[]
+  const worldFWRef = useRef<FWArray>([])
+
+  // Sequence state
+  const pendingRef      = useRef<Array<{ burst: PlaybackBurst; trailStartAt: number }>>([])
+  const trailsRef       = useRef<ActiveTrail[]>([])
+  const afterglowsRef   = useRef<Afterglow[]>([])
+  const seqStartRef     = useRef(0)
+  const holdUntilRef    = useRef(0)   // absolute perf.now() for afterglow hold
+  const finishedRef     = useRef(false)
+  const rafRef          = useRef(0)
+
+  // Visuals
   const starsRef  = useRef<Star[]>(generateStars(200))
   const frameRef  = useRef(0)
 
-  // Sequence scheduling
-  const pendingRef   = useRef<ScheduledBlueprint[]>([])
-  const startTimeRef = useRef<number>(0)
-  const patternSentRef = useRef(false)
-
-  // GIF capture
-  const framesRef   = useRef<ImageData[]>([])
+  // GIF
+  const framesRef    = useRef<ImageData[]>([])
   const capturingRef = useRef(false)
   const [gifState, setGifState] = useState<'idle' | 'encoding' | 'done'>('idle')
-  const gifBlobRef  = useRef<Blob | null>(null)
+  const gifBlobRef   = useRef<Blob | null>(null)
 
-  // ── Resize ────────────────────────────────────────────────────────────────
+  // ── Resize ──────────────────────────────────────────────────────────────────
 
   const resize = useCallback(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    canvas.width  = canvas.offsetWidth
-    canvas.height = canvas.offsetHeight
+    const c = canvasRef.current
+    if (!c) return
+    c.width  = c.offsetWidth
+    c.height = c.offsetHeight
   }, [])
 
   useEffect(() => {
     resize()
-    const observer = new ResizeObserver(resize)
-    if (canvasRef.current) observer.observe(canvasRef.current)
-    return () => observer.disconnect()
+    const ob = new ResizeObserver(resize)
+    if (canvasRef.current) ob.observe(canvasRef.current)
+    return () => ob.disconnect()
   }, [resize])
 
-  // ── Load new sequence ─────────────────────────────────────────────────────
+  // ── Load new playback ────────────────────────────────────────────────────────
 
   useEffect(() => {
-    if (!sequence) return
+    if (!playback) return
+
     finishedRef.current = false
-    patternSentRef.current = false
-    framesRef.current = []
+    framesRef.current   = []
     capturingRef.current = true
     setGifState('idle')
-    gifBlobRef.current = null
+    gifBlobRef.current  = null
+    worldFWRef.current  = []
+    trailsRef.current   = []
+    afterglowsRef.current = []
 
-    worldRef.current  = { fireworks: [], flashes: [], globalGlowAlpha: 0 }
-    pendingRef.current = [...sequence.shots, ...sequence.grandFinale]
-      .sort((a, b) => a.delayMs - b.delayMs)
-    startTimeRef.current = performance.now()
-  }, [sequence])
+    const now = performance.now()
+    seqStartRef.current = now
 
-  // ── Animation loop ────────────────────────────────────────────────────────
+    // holdUntil = when afterglows start fading: 1.5 s after last regular burst
+    holdUntilRef.current = now + playback.lastBurstDelay + 1500
+
+    // Pre-compute when each trail should start (burst fires at globalDelay,
+    // trail must start trailDuration ms before that)
+    pendingRef.current = playback.bursts.map(burst => ({
+      burst,
+      trailStartAt: burst.globalDelay - burst.trailDuration,
+    }))
+
+    console.log(`[FireworkCanvas] Loaded playback: ${playback.bursts.length} bursts`)
+  }, [playback])
+
+  // ── Animation loop ───────────────────────────────────────────────────────────
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -138,85 +266,133 @@ export default function FireworkCanvas({ sequence, onFinished, onPatternDetected
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    let framesSinceCapture = 0
+    let capFrames = 0
     const CAPTURE_EVERY = 3
 
     const loop = () => {
-      const w = canvas.width
-      const h = canvas.height
+      const w   = canvas.width
+      const h   = canvas.height
+      const now = performance.now()
       const frame = frameRef.current++
 
-      // ── Fire scheduled shots ────────────────────────────────────────────
-      if (pendingRef.current.length > 0) {
-        const elapsed = performance.now() - startTimeRef.current
-        const ready = pendingRef.current.filter(s => s.delayMs <= elapsed)
-        if (ready.length > 0) {
-          pendingRef.current = pendingRef.current.filter(s => s.delayMs > elapsed)
-          for (const shot of ready) {
-            const incoming = createWorldState(shot.blueprint)
-            worldRef.current = mergeWorld(worldRef.current, incoming)
-            // Sound: intensity based on particle count
-            const intensity = Math.min(1, shot.blueprint.particleVectors.length / 300)
-            playBoom(0.35 + intensity * 0.55)
-            // Notify parent of first pattern
-            if (!patternSentRef.current) {
-              patternSentRef.current = true
-              onPatternDetected?.(shot.blueprint.pattern)
+      if (playback) {
+        const elapsed = now - seqStartRef.current
+
+        // ── Spawn trails for due bursts ────────────────────────────────────
+        const stillPending: typeof pendingRef.current = []
+        for (const item of pendingRef.current) {
+          if (elapsed >= item.trailStartAt) {
+            const b  = item.burst
+            // Launch from bottom of screen, x ≈ burst x + slight random jitter
+            const p0 = { x: b.x + (Math.random() - 0.5) * 80, y: h + 16 }
+            // Control point: midpoint pulled left/right and upward
+            const p1 = {
+              x: (p0.x + b.x) / 2 + (Math.random() - 0.5) * 130,
+              y: (p0.y + b.y) / 2 - 60 - Math.random() * 60,
             }
+            trailsRef.current.push({
+              p0, p1, p2: { x: b.x, y: b.y },
+              color: b.color,
+              startTime: now,
+              duration: b.trailDuration,
+              burst: b,
+              done: false,
+            })
+          } else {
+            stillPending.push(item)
           }
         }
+        pendingRef.current = stillPending
+
+        // ── Check trail arrivals → fire burst + create afterglow ───────────
+        for (const trail of trailsRef.current) {
+          if (!trail.done && now - trail.startTime >= trail.duration) {
+            trail.done = true
+
+            // Particle burst
+            worldFWRef.current.push(
+              createSmallBurst(trail.p2.x, trail.p2.y, trail.burst.color, trail.burst.size),
+            )
+
+            // Sound (only for non-tiny bursts to avoid audio spam)
+            if (trail.burst.size !== 'small' && Math.random() < 0.4) {
+              playBoom(trail.burst.size === 'large' ? 0.22 : 0.13)
+            }
+
+            // Afterglow dot
+            afterglowsRef.current.push({
+              x: trail.p2.x,
+              y: trail.p2.y,
+              color: trail.burst.color,
+              baseRadius: trail.burst.size === 'large' ? 6 : trail.burst.size === 'medium' ? 5 : 3.5,
+              alpha: 0.9,
+              phase: Math.random() * Math.PI * 2,
+              holdUntil:    holdUntilRef.current,
+              fadeDuration: 3000,
+            })
+
+            console.log(
+              `[FireworkCanvas] Burst @ (${Math.round(trail.p2.x)},${Math.round(trail.p2.y)})`,
+              trail.burst.size, trail.burst.color,
+            )
+          }
+        }
+        trailsRef.current = trailsRef.current.filter(t => !t.done)
+
+        // ── Tick particle physics ──────────────────────────────────────────
+        worldFWRef.current = tickFireworks(worldFWRef.current)
       }
 
-      const hasActivity =
-        pendingRef.current.length > 0 ||
-        worldRef.current.fireworks.length > 0 ||
-        worldRef.current.flashes.length > 0 ||
-        worldRef.current.globalGlowAlpha > 0.002
-
-      // ── Background ─────────────────────────────────────────────────────
-      if (worldRef.current.fireworks.length > 0 || worldRef.current.globalGlowAlpha > 0.002) {
+      // ── Background ────────────────────────────────────────────────────────
+      const hasParticles = worldFWRef.current.length > 0 || trailsRef.current.length > 0
+      if (hasParticles) {
         ctx.globalAlpha = 1
-        ctx.shadowBlur = 0
-        ctx.fillStyle = 'rgba(0,0,0,0.18)'
+        ctx.shadowBlur  = 0
+        ctx.fillStyle   = 'rgba(0,0,0,0.18)'
         ctx.fillRect(0, 0, w, h)
       } else {
         ctx.clearRect(0, 0, w, h)
       }
 
-      // ── Stars ───────────────────────────────────────────────────────────
-      const glowBoost = 1 + worldRef.current.globalGlowAlpha * 1.2
-      drawStars(ctx, starsRef.current, frame, w, h, glowBoost)
+      // ── Stars ─────────────────────────────────────────────────────────────
+      drawStars(ctx, starsRef.current, frame, w, h)
 
-      // ── Fireworks ───────────────────────────────────────────────────────
-      if (hasActivity) {
-        worldRef.current = tickWorld(worldRef.current)
-        drawWorld(ctx, worldRef.current, w, h)
+      // ── Trails ────────────────────────────────────────────────────────────
+      for (const trail of trailsRef.current) drawTrail(ctx, trail, now)
 
-        if (capturingRef.current) {
-          framesSinceCapture++
-          if (framesSinceCapture >= CAPTURE_EVERY) {
-            framesSinceCapture = 0
-            framesRef.current.push(ctx.getImageData(0, 0, w, h))
-          }
-        }
+      // ── Burst particles ────────────────────────────────────────────────────
+      if (worldFWRef.current.length > 0) {
+        drawFireworks(ctx, worldFWRef.current)
+      }
 
-        // Completion check: no more pending shots AND world is empty
-        const next = worldRef.current
-        if (
-          pendingRef.current.length === 0 &&
-          next.fireworks.length === 0 &&
-          next.flashes.length === 0 &&
-          next.globalGlowAlpha <= 0.002 &&
-          !finishedRef.current
-        ) {
-          finishedRef.current = true
-          capturingRef.current = false
-          onFinished()
+      // ── Afterglows ─────────────────────────────────────────────────────────
+      afterglowsRef.current = afterglowsRef.current.filter(ag => drawAfterglow(ctx, ag, now))
+
+      // ── Vignette ──────────────────────────────────────────────────────────
+      drawVignette(ctx, w, h)
+
+      // ── GIF capture ───────────────────────────────────────────────────────
+      if (capturingRef.current && playback) {
+        capFrames++
+        if (capFrames >= CAPTURE_EVERY) {
+          capFrames = 0
+          framesRef.current.push(ctx.getImageData(0, 0, w, h))
         }
       }
 
-      // ── Vignette ────────────────────────────────────────────────────────
-      drawVignette(ctx, w, h)
+      // ── Completion check ──────────────────────────────────────────────────
+      if (
+        playback &&
+        !finishedRef.current &&
+        pendingRef.current.length === 0 &&
+        trailsRef.current.length === 0 &&
+        worldFWRef.current.length === 0 &&
+        afterglowsRef.current.length === 0
+      ) {
+        finishedRef.current = true
+        capturingRef.current = false
+        onFinished()
+      }
 
       rafRef.current = requestAnimationFrame(loop)
     }
@@ -226,7 +402,7 @@ export default function FireworkCanvas({ sequence, onFinished, onPatternDetected
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ── GIF export ────────────────────────────────────────────────────────────
+  // ── GIF export ───────────────────────────────────────────────────────────────
 
   const handleSaveGif = useCallback(() => {
     if (gifBlobRef.current) { downloadBlob(gifBlobRef.current); return }
@@ -240,15 +416,14 @@ export default function FireworkCanvas({ sequence, onFinished, onPatternDetected
       width: canvas.width, height: canvas.height,
       workerScript: gifWorkerUrl, repeat: 0, background: '#000000',
     })
-    const offscreen = document.createElement('canvas')
-    offscreen.width = canvas.width
-    offscreen.height = canvas.height
-    const offCtx = offscreen.getContext('2d')!
-    for (const frame of frames) {
-      offCtx.putImageData(frame, 0, 0)
-      gif.addFrame(offscreen, { delay: 50, copy: true })
+    const off = document.createElement('canvas')
+    off.width = canvas.width; off.height = canvas.height
+    const offCtx = off.getContext('2d')!
+    for (const f of frames) {
+      offCtx.putImageData(f, 0, 0)
+      gif.addFrame(off, { delay: 50, copy: true })
     }
-    gif.on('finished', (blob) => {
+    gif.on('finished', blob => {
       gifBlobRef.current = blob
       setGifState('done')
       downloadBlob(blob)
@@ -256,7 +431,7 @@ export default function FireworkCanvas({ sequence, onFinished, onPatternDetected
     gif.render()
   }, [])
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────────
 
   return (
     <div className="absolute inset-0">
@@ -286,8 +461,8 @@ export default function FireworkCanvas({ sequence, onFinished, onPatternDetected
 
 function downloadBlob(blob: Blob) {
   const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
+  const a   = document.createElement('a')
+  a.href     = url
   a.download = `firework-${Date.now()}.gif`
   a.click()
   URL.revokeObjectURL(url)

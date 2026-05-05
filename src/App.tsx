@@ -4,10 +4,10 @@ import DrawingCanvas from './components/DrawingCanvas'
 import type { DrawingCanvasHandle } from './components/DrawingCanvas'
 import FireworkCanvas from './components/FireworkCanvas'
 import Controls from './components/Controls'
-import { analyzeDrawingSequence } from './lib/strokeAnalyzer'
-import { playWhoosh, setMuted, isMuted } from './lib/audioEngine'
 import MuteButton from './components/MuteButton'
-import type { DrawingControls, Drawing, DrawingSequence, FireworkPattern } from './lib/types'
+import { buildDrawingPlayback } from './lib/strokeAnalyzer'
+import { playWhoosh, setMuted, isMuted } from './lib/audioEngine'
+import type { DrawingControls, Drawing, DrawingPlayback } from './lib/types'
 
 type Mode = 'drawing' | 'launching' | 'firework' | 'resetting'
 
@@ -16,18 +16,17 @@ const AUTO_RESET_MS = 5000
 const COUNTDOWN_SEC = 5
 
 export default function App() {
-  const [mode, setMode] = useState<Mode>('drawing')
+  const [mode, setMode]       = useState<Mode>('drawing')
   const [controls, setControls] = useState<DrawingControls>({ color: '#ffffff', lineWidth: 3 })
-  const [sequence, setSequence] = useState<DrawingSequence | null>(null)
-  const [activePattern, setActivePattern] = useState<FireworkPattern | null>(null)
+  const [playback, setPlayback] = useState<DrawingPlayback | null>(null)
   const [drawingKey, setDrawingKey] = useState(0)
-  const [countdown, setCountdown] = useState(COUNTDOWN_SEC)
+  const [countdown, setCountdown]   = useState(COUNTDOWN_SEC)
 
-  const drawingRef = useRef<DrawingCanvasHandle>(null)
-  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const drawingRef           = useRef<DrawingCanvasHandle>(null)
+  const resetTimerRef        = useRef<ReturnType<typeof setTimeout> | null>(null)
   const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // ── Launch ────────────────────────────────────────────────────────────────
+  // ── Launch ─────────────────────────────────────────────────────────────────
 
   const handleLaunch = useCallback((drawing: Drawing) => {
     if (drawing.strokes.length === 0) return
@@ -35,14 +34,13 @@ export default function App() {
     setMode('launching')
 
     setTimeout(() => {
-      const seq = analyzeDrawingSequence(drawing)
-      setSequence(seq)
-      setActivePattern(null)
+      const pb = buildDrawingPlayback(drawing)
+      setPlayback(pb)
       setMode('firework')
     }, GLOW_MS)
   }, [])
 
-  // ── Firework finished ─────────────────────────────────────────────────────
+  // ── Firework finished ──────────────────────────────────────────────────────
 
   const handleFireworkFinished = useCallback(() => {
     setMode('resetting')
@@ -55,8 +53,7 @@ export default function App() {
     resetTimerRef.current = setTimeout(() => {
       clearInterval(countdownIntervalRef.current!)
       setDrawingKey(k => k + 1)
-      setSequence(null)
-      setActivePattern(null)
+      setPlayback(null)
       setMode('drawing')
     }, AUTO_RESET_MS)
   }, [])
@@ -65,8 +62,7 @@ export default function App() {
     clearTimeout(resetTimerRef.current!)
     clearInterval(countdownIntervalRef.current!)
     setDrawingKey(k => k + 1)
-    setSequence(null)
-    setActivePattern(null)
+    setPlayback(null)
     setMode('drawing')
   }, [])
 
@@ -75,20 +71,17 @@ export default function App() {
     clearInterval(countdownIntervalRef.current!)
   }, [])
 
-  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────────
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).closest('input, textarea')) return
 
-      // M = mute toggle (works in any mode)
       if (e.code === 'KeyM' && !e.metaKey && !e.ctrlKey) {
-        setMuted(!isMuted())
-        return
+        setMuted(!isMuted()); return
       }
-
       if (mode === 'drawing' || mode === 'launching') {
-        if (e.code === 'Space') { e.preventDefault(); drawingRef.current?.launch() }
+        if (e.code === 'Space')                                { e.preventDefault(); drawingRef.current?.launch() }
         else if (e.code === 'KeyC' && !e.metaKey && !e.ctrlKey) drawingRef.current?.clear()
         else if (e.code === 'KeyZ' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); drawingRef.current?.undo() }
       } else if (mode === 'resetting' || mode === 'firework') {
@@ -99,15 +92,13 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [mode, handleDrawAgain])
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-black font-sans">
 
-      {/* Mute button — always visible, top-right */}
-      <div className="absolute top-2 right-3 z-50">
-        <MuteButton />
-      </div>
+      {/* Mute — always on top */}
+      <div className="absolute top-2 right-3 z-50"><MuteButton /></div>
 
       {/* Drawing screen */}
       <AnimatePresence>
@@ -148,28 +139,7 @@ export default function App() {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.4 }}
           >
-            <FireworkCanvas
-              sequence={sequence}
-              onFinished={handleFireworkFinished}
-              onPatternDetected={setActivePattern}
-            />
-
-            {/* Pattern badge — shows when first shot fires */}
-            <AnimatePresence>
-              {activePattern && mode === 'firework' && (
-                <motion.span
-                  key={activePattern}
-                  className="absolute top-4 left-1/2 -translate-x-1/2
-                             text-white/20 text-[11px] tracking-[0.25em] uppercase select-none"
-                  initial={{ opacity: 0, y: -4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.3 }}
-                >
-                  {activePattern}
-                </motion.span>
-              )}
-            </AnimatePresence>
+            <FireworkCanvas playback={playback} onFinished={handleFireworkFinished} />
 
             {/* Auto-reset overlay */}
             <AnimatePresence>

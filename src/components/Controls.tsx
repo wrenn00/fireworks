@@ -1,4 +1,6 @@
+import { useMemo } from 'react'
 import type { DrawingControls } from '../lib/types'
+import { generateVariations } from '../lib/colorUtils'
 
 const PRESET_COLORS = [
   '#ffffff', '#ff4444', '#ff9900', '#ffff00',
@@ -11,6 +13,9 @@ interface Props {
 }
 
 export default function Controls({ controls, onChange }: Props) {
+  // Deterministic preview of actual firework colors (stable per color choice)
+  const preview = useMemo(() => generateVariations(controls.color, 6), [controls.color])
+
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 sm:px-4 py-2.5
                     bg-white/4 border-b border-white/8 select-none">
@@ -49,6 +54,25 @@ export default function Controls({ controls, onChange }: Props) {
         </label>
       </div>
 
+      {/* Firework color preview — shows actual 70/20/10 distribution */}
+      <div
+        className="flex items-center gap-0.5"
+        title="Firework color preview"
+      >
+        {preview.map((c, i) => (
+          <div
+            key={i}
+            className="rounded-full flex-shrink-0"
+            style={{
+              width:  i === 0 ? 8 : 5,   // main color slightly larger
+              height: i === 0 ? 8 : 5,
+              backgroundColor: c,
+              boxShadow: `0 0 ${i === 0 ? 5 : 3}px 1px ${c}88`,
+            }}
+          />
+        ))}
+      </div>
+
       <div className="hidden sm:block w-px h-4 bg-white/15 flex-shrink-0" />
 
       {/* Width slider */}
@@ -70,7 +94,7 @@ export default function Controls({ controls, onChange }: Props) {
       {/* Keyboard hint — desktop only */}
       <div className="hidden md:flex flex-1 justify-end">
         <span className="text-white/15 text-[10px] tracking-wide">
-          Space · C · ⌘Z
+          Space · C · ⌘Z · M
         </span>
       </div>
     </div>

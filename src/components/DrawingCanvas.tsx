@@ -305,7 +305,7 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, Props>(function DrawingCan
                      transition-colors disabled:opacity-20 disabled:cursor-not-allowed
                      active:scale-95"
         >
-          {isLaunching ? 'Launching…' : 'Launch 🎆'}
+          {isLaunching ? 'Painting the sky…' : 'Show in the Sky 🎆'}
         </button>
       </div>
     </div>

@@ -1,83 +1,26 @@
 import type {
   Firework, Particle, TrailPoint, Flash, WorldState,
-  StrokeAnalysis, FireworkBlueprint, FireworkPattern,
+  StrokeAnalysis, FireworkBlueprint, FireworkPattern, BurstSize,
 } from './types'
+import { hexToHSL, hslToHex, getParticleColor } from './colorUtils'
 
 let nextId = 0
 
-// ── Colour palettes ───────────────────────────────────────────────────────────
+// ── Secondary explosion colour ────────────────────────────────────────────────
 
-const PALETTES = {
-  vivid:  ['#FF1B6B', '#FF6B35', '#FFD93D', '#6BCB77', '#4D96FF', '#9B59FF', '#FF6BCB'],
-  neon:   ['#00FFE5', '#FF00E5', '#FFFC00', '#00FF85', '#FF3D00', '#B800FF'],
-  pastel: ['#FFB3C6', '#FFD6A5', '#FDFFB6', '#CAFFBF', '#9BF6FF', '#A0C4FF', '#BDB2FF'],
-  warm:   ['#FF6B35', '#F7931E', '#FFD23F', '#FF1B6B', '#FF8C42', '#EE4266'],
-} as const
-
-type PaletteName = keyof typeof PALETTES
-const PALETTE_KEYS = Object.keys(PALETTES) as PaletteName[]
-
-function buildColorSet(mainColor: string): { main: string; accents: string[] } {
-  const palette = PALETTES[PALETTE_KEYS[Math.floor(Math.random() * PALETTE_KEYS.length)]]
-  const shuffled = [...palette].sort(() => Math.random() - 0.5)
-  return { main: mainColor, accents: shuffled.slice(0, 3) }
-}
-
-function pickColor(main: string, accents: string[]): string {
-  return Math.random() < 0.70
-    ? main
-    : accents[Math.floor(Math.random() * accents.length)]
-}
-
-// ── Colour math ───────────────────────────────────────────────────────────────
-
-function hexToRgb(hex: string): [number, number, number] {
-  const h = hex.replace('#', '')
-  const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h
-  const n = parseInt(full, 16)
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
-}
-
-function hslToHex(h: number, s: number, l: number): string {
-  const q = l < 0.5 ? l * (1 + s) : l + s - l * s
-  const p = 2 * l - q
-  const hue2rgb = (t: number) => {
-    const tt = ((t % 1) + 1) % 1
-    if (tt < 1 / 6) return p + (q - p) * 6 * tt
-    if (tt < 1 / 2) return q
-    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6
-    return p
-  }
-  const r = Math.round(hue2rgb(h + 1 / 3) * 255)
-  const g = Math.round(hue2rgb(h) * 255)
-  const b = Math.round(hue2rgb(h - 1 / 3) * 255)
-  return `#${[r, g, b].map(v => v.toString(16).padStart(2, '0')).join('')}`
-}
-
-/** Return the complementary colour (hue rotated 180°) */
-function complementColor(hex: string): string {
-  const [rr, gg, bb] = hexToRgb(hex).map(v => v / 255)
-  const max = Math.max(rr, gg, bb)
-  const min = Math.min(rr, gg, bb)
-  const l = (max + min) / 2
-  if (max === min) return hex
-
-  const d = max - min
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
-  let h: number
-  if (max === rr)      h = ((gg - bb) / d + (gg < bb ? 6 : 0)) / 6
-  else if (max === gg) h = ((bb - rr) / d + 2) / 6
-  else                 h = ((rr - gg) / d + 4) / 6
-
-  return hslToHex((h + 0.5) % 1, s, l)
-}
-
-/** Pick a random accent from the palette instead of direct complement */
+/**
+ * For secondary mini-bursts: hue rotated 30–60° from the seed color.
+ * Keeps the secondary clearly related to (but distinct from) the main burst.
+ */
 function secondaryColor(mainColor: string): string {
-  // 50% chance to use true complement, 50% random palette accent
-  if (Math.random() < 0.5) return complementColor(mainColor)
-  const palette = PALETTES[PALETTE_KEYS[Math.floor(Math.random() * PALETTE_KEYS.length)]]
-  return palette[Math.floor(Math.random() * palette.length)]
+  const { h, s, l } = hexToHSL(mainColor)
+  const rotation  = 30 + Math.random() * 30            // 30–60°
+  const direction = Math.random() < 0.5 ? 1 : -1
+  return hslToHex(
+    (h + direction * rotation + 360) % 360,
+    Math.max(70, s),
+    Math.max(45, Math.min(70, l)),
+  )
 }
 
 // ── Size / speed / life helpers ───────────────────────────────────────────────
@@ -219,19 +162,10 @@ function spawnSecondaryFirework(
 
 // ── Legacy factory ────────────────────────────────────────────────────────────
 
-function randomVariant(base: [number, number, number]): string {
-  const shift = () => Math.floor((Math.random() - 0.5) * 60)
-  const clamp = (v: number) => Math.min(255, Math.max(0, v))
-  const [r, g, b] = base
-  return `rgb(${clamp(r + shift())},${clamp(g + shift())},${clamp(b + shift())})`
-}
-
 export function createFirework(analysis: StrokeAnalysis, baseColor: string): Firework {
   const { burstPoint, length, speed, curvature } = analysis
-  const { main, accents } = buildColorSet(baseColor)
-  const count    = Math.min(600, Math.floor(250 + length * 0.3 + speed * 40))
-  const gravity  = 0.06
-  const rgb      = hexToRgb(baseColor)
+  const count   = Math.min(600, Math.floor(250 + length * 0.3 + speed * 40))
+  const gravity = 0.06
   const particles: Particle[] = []
 
   for (let i = 0; i < count; i++) {
@@ -240,7 +174,7 @@ export function createFirework(analysis: StrokeAnalysis, baseColor: string): Fir
       burstPoint.x, burstPoint.y,
       angle,
       0.8 + curvature * 0.8,
-      Math.random() < 0.7 ? main : randomVariant(hexToRgb(accents[0] ?? baseColor) as [number,number,number]) || randomVariant(rgb),
+      getParticleColor(baseColor),   // 70/20/10 rule — user color dominates
       gravity,
     ))
   }
@@ -252,12 +186,11 @@ export function createFirework(analysis: StrokeAnalysis, baseColor: string): Fir
 export function createFireworkFromBlueprint(blueprint: FireworkBlueprint): Firework {
   const { burstPoint, particleVectors, pattern } = blueprint
   const gravity   = GRAVITY[pattern]
+  // hintColor comes from stroke.color via strokeAnalyzer — the user's chosen color
   const hintColor = particleVectors[0]?.color ?? '#ffffff'
-  const { main, accents } = buildColorSet(hintColor)
 
   // ── Outline: one physics-free particle per target point ─────────────────────
   if (pattern === 'outline') {
-    // Use each vector's targetX/targetY; cycle if we want more density
     const density  = Math.min(3, Math.max(1, Math.floor(300 / Math.max(particleVectors.length, 1))))
     const particles: Particle[] = []
 
@@ -265,10 +198,9 @@ export function createFireworkFromBlueprint(blueprint: FireworkBlueprint): Firew
       const tx = vec.targetX ?? burstPoint.x
       const ty = vec.targetY ?? burstPoint.y
       for (let d = 0; d < density; d++) {
-        // slight position jitter so overlapping dots look like a glowing node
         const ox = burstPoint.x + (Math.random() - 0.5) * 4
         const oy = burstPoint.y + (Math.random() - 0.5) * 4
-        particles.push(spawnOutlineParticle(ox, oy, tx, ty, pickColor(main, accents)))
+        particles.push(spawnOutlineParticle(ox, oy, tx, ty, getParticleColor(hintColor)))
       }
     }
     return { id: nextId++, particles, alive: true }
@@ -287,7 +219,7 @@ export function createFireworkFromBlueprint(blueprint: FireworkBlueprint): Firew
       burstPoint.x, burstPoint.y,
       angle,
       0.7 + speedN * 0.6,
-      pickColor(main, accents),
+      getParticleColor(hintColor),   // 70/20/10 rule
       gravity,
     ))
   }
@@ -441,6 +373,52 @@ export function tickWorld(world: WorldState): WorldState {
   }
 }
 
+// ── Small focused burst (path-playback system) ────────────────────────────────
+
+const SMALL_BURST_PARAMS: Record<BurstSize, {
+  count: number; maxSpeed: number; lifeMin: number; lifeMax: number
+}> = {
+  small:  { count: 30, maxSpeed: 4,  lifeMin: 50, lifeMax: 72  },
+  medium: { count: 55, maxSpeed: 6,  lifeMin: 65, lifeMax: 92  },
+  large:  { count: 80, maxSpeed: 9,  lifeMin: 80, lifeMax: 105 },
+}
+
+/**
+ * Create a small, focused burst at absolute canvas position (x, y).
+ * Particles stay within ~30–80 px radius depending on size tier.
+ * No secondary explosions — keeps the path readable.
+ */
+export function createSmallBurst(
+  x: number, y: number,
+  color: string,    // stroke.color — the user's chosen color
+  size: BurstSize,
+): Firework {
+  const { count, maxSpeed, lifeMin, lifeMax } = SMALL_BURST_PARAMS[size]
+
+  const particles: Particle[] = Array.from({ length: count }, () => {
+    const angle   = Math.random() * Math.PI * 2
+    const speed   = maxSpeed * (0.25 + Math.random() * 0.75)
+    const maxLife = lifeMin + Math.floor(Math.random() * (lifeMax - lifeMin))
+
+    return {
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      alpha: 1,
+      color: getParticleColor(color),   // 70/20/10 rule — user color dominates
+      size: 0.6 + Math.random() * 1.4,
+      gravity: 0.05,
+      life: maxLife,
+      maxLife,
+      trail: [],
+      decay: 0,
+      secondaryAt: undefined,   // no chain explosions from small bursts
+    }
+  })
+
+  return { id: nextId++, particles, alive: true }
+}
+
 /** Legacy shim — kept for code paths that haven't migrated to WorldState */
 export function tickFireworks(fireworks: Firework[]): Firework[] {
   return tickWorld({ fireworks, flashes: [], globalGlowAlpha: 0 }).fireworks
@@ -543,6 +521,11 @@ export function drawFireworks(ctx: CanvasRenderingContext2D, fireworks: Firework
 
 /** Convert a hex color + alpha 0-1 to a CSS rgba() string */
 function hexWithAlpha(hex: string, alpha: number): string {
-  const [r, g, b] = hexToRgb(hex)
+  const raw  = hex.replace('#', '')
+  const full = raw.length === 3 ? raw.split('').map(c => c + c).join('') : raw
+  const n    = parseInt(full, 16)
+  const r    = (n >> 16) & 255
+  const g    = (n >>  8) & 255
+  const b    =  n        & 255
   return `rgba(${r},${g},${b},${alpha.toFixed(3)})`
 }
