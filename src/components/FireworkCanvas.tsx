@@ -1,19 +1,24 @@
 /**
  * FireworkCanvas
  *
- * Plays back a DrawingPlayback: for each burst position (sampled from the
- * user's drawn path) it launches a projectile trail from the bottom of the
- * screen, then detonates a full-size firework explosion.
+ * "그린 선이 빛의 궤적이 되어, 그린 순서대로 폭죽이 라인을 그리며 펑펑 터진다."
  *
- * NO afterglow dots, NO persistent position markers.
- * After all particles fade, the screen returns to clean black + stars.
+ * Each burst in the DrawingPlayback fires a medium-sized explosion at the
+ * position on the user's drawn path.  A short local pop-trail (80–150 ms,
+ * launches just below the burst point) gives a quick "whoosh" before the
+ * explosion — NOT a long ascending rocket from the screen bottom.
+ *
+ * Motion blur at rgba(0,0,0,0.10) lets particle trails persist ~1–2 s so the
+ * line shape is visible while the sequence plays, then naturally fades.
+ *
+ * No persistent afterglow dots.  Screen is clean once all particles die.
  */
 import { useRef, useEffect, useCallback, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import GIF from 'gif.js'
 import gifWorkerUrl from 'gif.js/dist/gif.worker.js?url'
 import type { DrawingPlayback, PlaybackBurst, Firework } from '../lib/types'
-import { createFullBurst, tickFireworks, drawFireworks } from '../lib/fireworkEngine'
+import { createMediumBurst, tickFireworks, drawFireworks } from '../lib/fireworkEngine'
 import { playBoom } from '../lib/audioEngine'
 
 interface Props {
@@ -21,15 +26,15 @@ interface Props {
   onFinished: () => void
 }
 
-// ── Trail ─────────────────────────────────────────────────────────────────────
+// ── Short local pop-trail ─────────────────────────────────────────────────────
 
 interface ActiveTrail {
-  p0: { x: number; y: number }   // launch point (bottom edge)
-  p1: { x: number; y: number }   // bezier control point
+  p0: { x: number; y: number }   // slightly below burst point
+  p1: { x: number; y: number }   // control point (near midway)
   p2: { x: number; y: number }   // burst destination
   color: string
   startTime: number
-  duration: number
+  duration: number                // 80–150 ms
   burst: PlaybackBurst
   done: boolean
 }
@@ -49,27 +54,27 @@ function quadBez(
 
 function drawTrail(ctx: CanvasRenderingContext2D, trail: ActiveTrail, now: number) {
   const t    = Math.min(1, (now - trail.startTime) / trail.duration)
-  const TAIL = 0.16   // trailing fraction of path visible behind the head
+  const TAIL = 0.5    // short burst: render the full tail half
 
   ctx.fillStyle   = trail.color
   ctx.shadowColor = trail.color
 
-  const steps = 16
+  const steps = 10
   for (let i = 0; i <= steps; i++) {
     const frac = i / steps
     const ti   = Math.max(0, t - TAIL + frac * TAIL)
     const pos  = quadBez(trail.p0, trail.p1, trail.p2, ti)
-    ctx.globalAlpha = frac * 0.80
-    ctx.shadowBlur  = frac * 10
+    ctx.globalAlpha = frac * 0.85
+    ctx.shadowBlur  = frac * 12
     ctx.beginPath()
-    ctx.arc(pos.x, pos.y, 0.4 + frac * 1.8, 0, Math.PI * 2)
+    ctx.arc(pos.x, pos.y, 0.5 + frac * 2, 0, Math.PI * 2)
     ctx.fill()
   }
 
-  // Bright sparkling head
+  // Bright head
   const head = quadBez(trail.p0, trail.p1, trail.p2, t)
   ctx.globalAlpha = 1
-  ctx.shadowBlur  = 20
+  ctx.shadowBlur  = 22
   ctx.beginPath()
   ctx.arc(head.x, head.y, 3, 0, Math.PI * 2)
   ctx.fill()
@@ -122,14 +127,13 @@ function drawVignette(ctx: CanvasRenderingContext2D, w: number, h: number) {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function FireworkCanvas({ playback, onFinished }: Props) {
-  const canvasRef   = useRef<HTMLCanvasElement>(null)
+  const canvasRef    = useRef<HTMLCanvasElement>(null)
   const fireworksRef = useRef<Firework[]>([])
-
-  const pendingRef  = useRef<Array<{ burst: PlaybackBurst; trailStartAt: number }>>([])
-  const trailsRef   = useRef<ActiveTrail[]>([])
-  const seqStartRef = useRef(0)
-  const finishedRef = useRef(false)
-  const rafRef      = useRef(0)
+  const pendingRef   = useRef<Array<{ burst: PlaybackBurst; trailStartAt: number }>>([])
+  const trailsRef    = useRef<ActiveTrail[]>([])
+  const seqStartRef  = useRef(0)
+  const finishedRef  = useRef(false)
+  const rafRef       = useRef(0)
 
   const starsRef = useRef<Star[]>(generateStars(200))
   const frameRef = useRef(0)
@@ -171,12 +175,14 @@ export default function FireworkCanvas({ playback, onFinished }: Props) {
     const now = performance.now()
     seqStartRef.current = now
 
+    // Trail starts trailDuration ms before the burst fires
     pendingRef.current = playback.bursts.map(b => ({
       burst: b,
       trailStartAt: b.globalDelay - b.trailDuration,
     }))
 
-    console.log(`[FireworkCanvas] ${playback.bursts.length} bursts loaded`)
+    console.log(`[FireworkCanvas] ${playback.bursts.length} bursts, ` +
+      `total duration ~${(playback.lastBurstDelay / 1000).toFixed(1)}s`)
   }, [playback])
 
   // ── Animation loop ────────────────────────────────────────────────────────────
@@ -198,16 +204,15 @@ export default function FireworkCanvas({ playback, onFinished }: Props) {
       if (playback) {
         const elapsed = now - seqStartRef.current
 
-        // ── Spawn trails for due bursts ──────────────────────────────────────
+        // ── Spawn pop-trails for due bursts ──────────────────────────────────
         const stillPending: typeof pendingRef.current = []
         for (const item of pendingRef.current) {
           if (elapsed >= item.trailStartAt) {
             const b = item.burst
-            const p0 = { x: b.x + (Math.random() - 0.5) * 100, y: h + 20 }
-            const p1 = {
-              x: (p0.x + b.x) / 2 + (Math.random() - 0.5) * 150,
-              y: (p0.y + b.y) / 2 - 80 - Math.random() * 80,
-            }
+            // Pop-trail: starts 25–45 px directly below the burst point
+            const dropY = 25 + Math.random() * 20
+            const p0 = { x: b.x + (Math.random() - 0.5) * 15, y: b.y + dropY }
+            const p1 = { x: (p0.x + b.x) / 2 + (Math.random() - 0.5) * 20, y: (p0.y + b.y) / 2 }
             trailsRef.current.push({
               p0, p1, p2: { x: b.x, y: b.y },
               color: b.color,
@@ -222,53 +227,54 @@ export default function FireworkCanvas({ playback, onFinished }: Props) {
         }
         pendingRef.current = stillPending
 
-        // ── Fire arrived trails ──────────────────────────────────────────────
+        // ── Fire arrived trails ───────────────────────────────────────────────
         for (const trail of trailsRef.current) {
           if (!trail.done && now - trail.startTime >= trail.duration) {
             trail.done = true
-            fireworksRef.current.push(createFullBurst(trail.p2.x, trail.p2.y, trail.burst.color))
-            playBoom(0.3 + Math.random() * 0.3)
-            console.log(`[FireworkCanvas] Burst @ (${Math.round(trail.p2.x)},${Math.round(trail.p2.y)}) ${trail.burst.color}`)
+            fireworksRef.current.push(
+              createMediumBurst(trail.p2.x, trail.p2.y, trail.burst.color, trail.burst.dirAngle ?? 0),
+            )
+            // Subtle sound — not every burst to avoid audio overload
+            if (Math.random() < 0.5) playBoom(0.15 + Math.random() * 0.15)
           }
         }
         trailsRef.current = trailsRef.current.filter(t => !t.done)
 
-        // ── Physics tick ─────────────────────────────────────────────────────
+        // ── Physics tick ──────────────────────────────────────────────────────
         fireworksRef.current = tickFireworks(fireworksRef.current)
       }
 
-      // ── Background ──────────────────────────────────────────────────────────
+      // ── Background ───────────────────────────────────────────────────────────
+      // Motion blur 0.20 → particles persist ~0.5–1 s; each burst is distinct.
+      // Stronger than before so adjacent small bursts don't accumulate into one blob.
       const hasActive = fireworksRef.current.length > 0 || trailsRef.current.length > 0
       if (hasActive) {
         ctx.globalAlpha = 1; ctx.shadowBlur = 0
-        ctx.fillStyle = 'rgba(0,0,0,0.18)'
+        ctx.fillStyle = 'rgba(0,0,0,0.20)'
         ctx.fillRect(0, 0, w, h)
       } else {
         ctx.clearRect(0, 0, w, h)
       }
 
-      // ── Stars ────────────────────────────────────────────────────────────────
+      // ── Stars ─────────────────────────────────────────────────────────────────
       drawStars(ctx, starsRef.current, frame, w, h)
 
-      // ── Trails ──────────────────────────────────────────────────────────────
+      // ── Pop-trails ────────────────────────────────────────────────────────────
       for (const trail of trailsRef.current) drawTrail(ctx, trail, now)
 
-      // ── Firework particles ───────────────────────────────────────────────────
+      // ── Firework particles ────────────────────────────────────────────────────
       if (fireworksRef.current.length > 0) drawFireworks(ctx, fireworksRef.current)
 
-      // ── Vignette ─────────────────────────────────────────────────────────────
+      // ── Vignette ──────────────────────────────────────────────────────────────
       drawVignette(ctx, w, h)
 
-      // ── GIF capture ──────────────────────────────────────────────────────────
+      // ── GIF capture ───────────────────────────────────────────────────────────
       if (capturingRef.current && playback) {
         capFrames++
-        if (capFrames >= 3) {
-          capFrames = 0
-          framesRef.current.push(ctx.getImageData(0, 0, w, h))
-        }
+        if (capFrames >= 3) { capFrames = 0; framesRef.current.push(ctx.getImageData(0, 0, w, h)) }
       }
 
-      // ── Completion: all trails fired, all particles gone ──────────────────────
+      // ── Completion ────────────────────────────────────────────────────────────
       if (
         playback && !finishedRef.current &&
         pendingRef.current.length === 0 &&

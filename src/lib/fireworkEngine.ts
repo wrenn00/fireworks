@@ -44,8 +44,9 @@ function pickLife(): number {
 }
 
 function lifeAlpha(life: number, maxLife: number): number {
-  const ratio = life / maxLife
-  return ratio >= 0.30 ? 1 : ratio / 0.30
+  const ratio = life / maxLife   // 1 → 0 as particle ages
+  // Full alpha for first 60 % of life; linear fade for last 40 %
+  return ratio >= 0.40 ? 1 : ratio / 0.40
 }
 
 // ── Per-pattern gravity ───────────────────────────────────────────────────────
@@ -419,6 +420,62 @@ export function createSmallBurst(
   return { id: nextId++, particles, alive: true }
 }
 
+// ── Medium burst (primary path-playback system) ───────────────────────────────
+
+/**
+ * A single burst tuned for the "line of fireworks" concept:
+ *   - 60–120 particles  (visible pop, not screen-filling)
+ *   - Speed 4–10        (spreads ~6–10% of screen width)
+ *   - Life 50–90 frames (~1–1.5 s)
+ *   - 70% omnidirectional + 30% biased ±60° along the stroke's travel direction
+ *
+ * The directional bias makes the burst feel like it's "rushing along the line".
+ */
+export function createMediumBurst(
+  x: number, y: number,
+  color: string,
+  dirAngle = 0,    // radians — stroke travel direction at this point
+): Firework {
+  // 25–50 particles: small enough that adjacent bursts don't merge into one blob
+  const count = 25 + Math.floor(Math.random() * 26)
+
+  const particles: Particle[] = Array.from({ length: count }, (_, idx) => {
+    // Smaller size tiers so each burst occupies ~3–5% of screen width
+    const rSize = Math.random()
+    const size  = rSize < 0.10 ? 2.5 + Math.random() * 1.0   // large  10%: 2.5–3.5
+                : rSize < 0.70 ? 1.2 + Math.random() * 0.8   // medium 60%: 1.2–2.0
+                :                0.4 + Math.random() * 0.6    // small  30%: 0.4–1.0
+
+    // Speed 3–6: slow enough to stay compact, spread ~50–100 px
+    const speed = 3 + Math.random() * 3
+
+    // 30% biased ±60° along stroke direction; 70% omnidirectional
+    const angle = idx < count * 0.30
+      ? dirAngle + (Math.random() - 0.5) * (Math.PI * 2 / 3)
+      : Math.random() * Math.PI * 2
+
+    // Life 35–60 frames (~0.6–1 s) — pops and disappears cleanly
+    const maxLife = 35 + Math.floor(Math.random() * 26)
+
+    return {
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      alpha: 1,
+      color: getParticleColor(color),
+      size,
+      gravity: 0.04 + Math.random() * 0.02,
+      life: maxLife,
+      maxLife,
+      trail: [],
+      decay: 0,
+      secondaryAt: undefined,   // no secondary chains — keeps each burst crisp
+    }
+  })
+
+  return { id: nextId++, particles, alive: true }
+}
+
 // ── Full-size burst (primary path-playback system) ────────────────────────────
 
 /**
@@ -527,15 +584,15 @@ export function drawWorld(
     }
   }
 
-  // ── Pass 2: glow halos ────────────────────────────────────────────────────
+  // ── Pass 2: glow halos (tighter glow for compact bursts) ────────────────────
   for (const fw of world.fireworks) {
     for (const p of fw.particles) {
-      ctx.globalAlpha = p.alpha * 0.30
+      ctx.globalAlpha = p.alpha * 0.25
       ctx.fillStyle = p.color
       ctx.shadowColor = p.color
-      ctx.shadowBlur = p.size * 10
+      ctx.shadowBlur = p.size * 4      // was *10 — smaller halo keeps bursts distinct
       ctx.beginPath()
-      ctx.arc(p.x, p.y, p.size * 2.2, 0, Math.PI * 2)
+      ctx.arc(p.x, p.y, p.size * 1.6, 0, Math.PI * 2)   // was *2.2
       ctx.fill()
     }
   }
@@ -546,7 +603,7 @@ export function drawWorld(
       ctx.globalAlpha = p.alpha
       ctx.fillStyle = p.color
       ctx.shadowColor = p.color
-      ctx.shadowBlur = p.size * 4
+      ctx.shadowBlur = p.size * 2      // was *4 — crisper, less bleed
       ctx.beginPath()
       ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2)
       ctx.fill()

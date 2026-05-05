@@ -97,10 +97,12 @@ export type BurstSize = 'small' | 'medium' | 'large'
 export interface PlaybackBurst {
   x: number
   y: number
-  globalDelay: number   // ms from playback start → when the burst fires
+  globalDelay: number    // ms from playback start → when the burst fires
   color: string
   size: BurstSize
-  trailDuration: number // ms for the ascending trail (pre-computed)
+  trailDuration: number  // ms for the short local pop-trail (80–150 ms)
+  dirAngle?: number      // radians — stroke travel direction at this point
+                         // used to add directional bias to 30% of particles
 }
 
 /**
@@ -108,9 +110,8 @@ export interface PlaybackBurst {
  * Passed to FireworkCanvas; replaces the old DrawingSequence.
  */
 export interface DrawingPlayback {
-  bursts: PlaybackBurst[]   // sorted by globalDelay; includes finale bursts
-  lastBurstDelay: number    // ms of the last regular (non-finale) burst
-                            // used to set afterglow holdUntil timing
+  bursts: PlaybackBurst[]  // sorted by globalDelay; includes finale bursts
+  lastBurstDelay: number   // ms of the last regular burst (for timing ref)
 }
 
 // ── Firework blueprint ────────────────────────────────────────────────────────

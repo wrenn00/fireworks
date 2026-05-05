@@ -475,8 +475,8 @@ function resampleWithTime(points: Point[], n: number): SampledPoint[] {
 /** Convert raw sample timestamps to delays (ms from 0), clamping per-gap to [minGap, maxGap] */
 function computeDelays(
   samples: SampledPoint[],
-  minGap = 150,   // minimum gap between bursts — enough to see each explosion
-  maxGap = 300,   // maximum gap — keeps the sequence snappy
+  minGap = 80,    // slow enough that each small burst is individually visible
+  maxGap = 150,   // keeps the sequence flowing without long gaps
 ): number[] {
   if (samples.length === 0) return []
   const result = [0]
@@ -513,23 +513,34 @@ function burstSizeForStroke(strokeWidth: number): BurstSize {
  */
 function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBurst[] {
   const arc = arcLength(stroke.points)
-  // 6–12 bursts per stroke — sparse enough that each big explosion is visible
-  // and the shape is recognisable from the pattern of detonations.
-  const n = Math.max(6, Math.min(12, Math.round(arc / 60)))
+  // 12–20 bursts per stroke.
+  // Dense enough to trace the line; sparse enough that adjacent small bursts
+  // don't merge into one blob (one burst every ~50 px of arc).
+  const n = Math.max(12, Math.min(20, Math.round(arc / 50)))
 
   const samples = resampleWithTime(stroke.points, n)
   const delays  = computeDelays(samples)
   const colors  = burstColors(stroke.color, n)
   const size    = burstSizeForStroke(stroke.width)
 
-  return samples.map((s, i) => ({
-    x: s.x,
-    y: s.y,
-    globalDelay:   timeOffset + delays[i],
-    color:         colors[i],
-    size,
-    trailDuration: 500 + Math.random() * 300,  // 500–800 ms ascent
-  }))
+  return samples.map((s, i) => {
+    // Direction of travel at this sample (toward next point, or from prev)
+    const prev = samples[Math.max(0, i - 1)]
+    const next = samples[Math.min(n - 1, i + 1)]
+    const dirAngle = Math.atan2(next.y - prev.y, next.x - prev.x)
+
+    return {
+      x: s.x,
+      y: s.y,
+      globalDelay:   timeOffset + delays[i],
+      color:         colors[i],
+      size,
+      // Short local pop-trail: launches from just below the burst point,
+      // not from the screen bottom.  Gives a quick "pop!" feeling (80–150 ms).
+      trailDuration: 80 + Math.random() * 70,
+      dirAngle,
+    }
+  })
 }
 
 /**
@@ -542,7 +553,7 @@ function strokeToPlaybackBursts(stroke: Stroke, timeOffset: number): PlaybackBur
  *   1000 ms pause → grand finale (5–8 big bursts, random screen positions)
  */
 export function buildDrawingPlayback(drawing: Drawing): DrawingPlayback {
-  const STROKE_GAP_MS = 800
+  const STROKE_GAP_MS = 300    // short gap between strokes — keeps the show flowing
   const FINALE_GAP_MS = 1000   // 1 s pause before finale
 
   const regularBursts: PlaybackBurst[] = []
@@ -560,7 +571,7 @@ export function buildDrawingPlayback(drawing: Drawing): DrawingPlayback {
 
   // Grand finale: 5–8 big fireworks at random positions across the viewport
   const finaleStart  = lastRegularDelay + FINALE_GAP_MS
-  const finaleCount  = 5 + Math.floor(Math.random() * 4)   // 5–8
+  const finaleCount  = 4 + Math.floor(Math.random() * 3)   // 4–6
   const vw = typeof window !== 'undefined' ? window.innerWidth  : 900
   const vh = typeof window !== 'undefined' ? window.innerHeight : 700
   const strokeColors = drawing.strokes.map(s => s.color)
